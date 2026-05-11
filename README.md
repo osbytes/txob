@@ -1,9 +1,9 @@
 <h1 align="center">txob</h1>
 <p align="center">Reliably process side-effects in your Node.js applications without data loss</p>
 <p align="center">
-  <a href="https://osbytes.vercel.app" target="_blank" rel="noopener noreferrer" title="osbytes — open source bytes">
+  <a href="https://www.osbytes.io" target="_blank" rel="noopener noreferrer" title="osbytes — open source bytes">
      <img
-       src="https://osbytes.vercel.app/badge.svg"
+       src="https://www.osbytes.io/badge.svg"
        alt="osbytes — open source bytes"
        width="24"
        height="24"
