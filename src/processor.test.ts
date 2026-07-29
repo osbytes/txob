@@ -16,6 +16,7 @@ import {
   TxOBTelemetryMetricName,
   TxOBTelemetrySpanName,
 } from "./telemetry.js";
+import * as sleepModule from "./sleep.js";
 
 const mockTxClient = {
   getEventByIdForUpdateSkipLocked: vi.fn(),
@@ -70,12 +71,33 @@ describe("createEventProcessor", () => {
   });
 });
 
+function createTestWakeupEmitter() {
+  const listeners = new Map<string, Set<() => void>>();
+  return {
+    on: vi.fn((event: "wakeup", listener: () => void) => {
+      if (event !== "wakeup") return;
+      let set = listeners.get(event);
+      if (!set) {
+        set = new Set();
+        listeners.set(event, set);
+      }
+      set.add(listener);
+    }),
+    off: vi.fn((event: "wakeup", listener: () => void) => {
+      listeners.get(event)?.delete(listener);
+    }),
+    close: vi.fn(async () => {}),
+    emitWakeup: () => {
+      for (const l of listeners.get("wakeup") ?? []) l();
+    },
+  };
+}
+
 describe("EventProcessor - schema typing", () => {
   it("infers handler event data from Standard Schema outputs", () => {
-    const createSchema = <TOutput extends Record<string, unknown>>(): StandardSchemaV1<
-      unknown,
-      TOutput
-    > => ({
+    const createSchema = <
+      TOutput extends Record<string, unknown>,
+    >(): StandardSchemaV1<unknown, TOutput> => ({
       "~standard": {
         version: 1,
         vendor: "test",
@@ -1203,9 +1225,16 @@ describe("EventProcessor - lifecycle", () => {
     expect(aborted).toBe(true);
   });
   it("should respect shutdown timeout and throw", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
     const handlerMap = {
       evtType1: {
-        handler1: vi.fn(() => sleep(100)),
+        // Never resolves so work would stay pending if the queue did not abort it
+        handler1: vi.fn(() => new Promise<void>(() => {})),
       },
     };
     const evt1: TxOBEvent<keyof typeof handlerMap> = {
@@ -1218,7 +1247,10 @@ describe("EventProcessor - lifecycle", () => {
       errors: 0,
     };
     let callCount = 0;
-    mockClient.getEventsToProcess.mockImplementation(() => {
+    mockClient.getEventsToProcess.mockImplementation((opts) => {
+      if (opts?.signal?.aborted) {
+        return Promise.reject(new DOMException("Aborted", "AbortError"));
+      }
       callCount++;
       return Promise.resolve(callCount === 1 ? [evt1] : []);
     });
@@ -1231,17 +1263,35 @@ describe("EventProcessor - lifecycle", () => {
       client: mockClient,
       handlerMap,
       pollingIntervalMs: 10,
+      logger,
     });
     processor.start();
 
-    const start = Date.now();
-    try {
-      await processor.stop({ timeoutMs: 10 });
-    } catch (error: any) {
-      expect(error.message).toBe("shutdown timeout 10ms elapsed");
+    for (let i = 0; i < 100; i++) {
+      if (handlerMap.evtType1.handler1.mock.calls.length > 0) break;
+      await sleep(5);
     }
-    const diff = Date.now() - start;
-    expect(diff).toBeLessThan(50);
+    expect(handlerMap.evtType1.handler1).toHaveBeenCalled();
+
+    // Abort clears in-flight queue work quickly, so onPendingZero() normally settles
+    // before the shutdown timer. Stub it to model a hung queue and exercise the
+    // timeout + error logging path.
+    const queue = (
+      processor as unknown as { queue: { onPendingZero: () => Promise<void> } }
+    ).queue;
+    vi.spyOn(queue, "onPendingZero").mockImplementation(
+      () => new Promise<void>(() => {}),
+    );
+
+    const start = Date.now();
+    await expect(processor.stop({ timeoutMs: 40 })).rejects.toThrow(
+      "shutdown timeout 40ms elapsed",
+    );
+    expect(Date.now() - start).toBeLessThan(500);
+    expect(logger.error).toHaveBeenCalledWith(
+      { error: expect.any(Error) },
+      "shutdown error",
+    );
   });
   it("should warn when stopping a processor that is not started", async () => {
     const logger = {
@@ -1391,6 +1441,324 @@ describe("EventProcessor - lifecycle", () => {
 
     expect(logger.error).toHaveBeenCalled();
     expect(calls).toBeGreaterThan(0);
+  });
+});
+
+describe("EventProcessor - wakeup and polling edge cases", () => {
+  it("skips a poll when the previous poll is still awaiting the client", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    let releaseGetEvents!: (value: { id: string; errors: number }[]) => void;
+    const getEventsBlocked = new Promise<{ id: string; errors: number }[]>(
+      (resolve) => {
+        releaseGetEvents = resolve;
+      },
+    );
+    mockClient.getEventsToProcess.mockImplementationOnce(
+      () => getEventsBlocked,
+    );
+
+    const wakeup = createTestWakeupEmitter();
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 1000,
+      wakeupEmitter: wakeup,
+      wakeupThrottleMs: 0,
+      wakeupTimeoutMs: 60_000,
+      logger,
+    });
+    processor.start();
+
+    await vi.waitFor(
+      () => {
+        expect(mockClient.getEventsToProcess).toHaveBeenCalled();
+      },
+      { timeout: 2000 },
+    );
+
+    wakeup.emitWakeup();
+    await sleep(15);
+
+    expect(logger.debug).toHaveBeenCalledWith(
+      "skipping poll - already polling",
+    );
+
+    releaseGetEvents([]);
+    await processor.stop();
+  });
+
+  it("skips polling when the in-memory queue is at capacity", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const handlerMap = {
+      evtType1: {
+        handler1: vi.fn(() => new Promise<void>(() => {})),
+      },
+    };
+    const evt1: TxOBEvent<keyof typeof handlerMap> = {
+      type: "evtType1",
+      id: "1",
+      timestamp: now,
+      data: {},
+      correlation_id: "abc123",
+      handler_results: {},
+      errors: 0,
+    };
+    mockClient.getEventsToProcess.mockImplementation((opts) => {
+      if (opts?.signal?.aborted) {
+        return Promise.reject(new DOMException("Aborted", "AbortError"));
+      }
+      return Promise.resolve([evt1]);
+    });
+    mockTxClient.getEventByIdForUpdateSkipLocked.mockImplementation(() =>
+      Promise.resolve(evt1),
+    );
+    mockTxClient.updateEvent.mockImplementation(() => Promise.resolve());
+
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap,
+      pollingIntervalMs: 15,
+      maxQueuedEvents: 1,
+      logger,
+    });
+    processor.start();
+
+    await vi.waitFor(
+      () => {
+        expect(logger.debug).toHaveBeenCalledWith(
+          expect.objectContaining({
+            queuedCount: 1,
+            maxQueuedEvents: 1,
+          }),
+          "skipping poll - queue at capacity",
+        );
+      },
+      { timeout: 3000 },
+    );
+
+    await processor.stop();
+  });
+
+  it("logs and continues when getEventsToProcess rejects", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const pollError = new Error("database unavailable");
+    let calls = 0;
+    mockClient.getEventsToProcess.mockImplementation((opts) => {
+      if (opts?.signal?.aborted) {
+        return Promise.reject(new DOMException("Aborted", "AbortError"));
+      }
+      calls++;
+      if (calls === 1) return Promise.reject(pollError);
+      return Promise.resolve([]);
+    });
+
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 10,
+      logger,
+    });
+    processor.start();
+
+    await vi.waitFor(
+      () => {
+        expect(logger.error).toHaveBeenCalledWith(
+          { error: pollError },
+          "error polling for events, will retry",
+        );
+      },
+      { timeout: 2000 },
+    );
+
+    expect(calls).toBeGreaterThanOrEqual(2);
+    await processor.stop();
+  });
+
+  it("runs fallback polling when no wakeup arrives within wakeupTimeoutMs", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    mockClient.getEventsToProcess.mockImplementation((opts) => {
+      if (opts?.signal?.aborted) {
+        return Promise.reject(new DOMException("Aborted", "AbortError"));
+      }
+      return Promise.resolve([]);
+    });
+
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 15,
+      wakeupEmitter: createTestWakeupEmitter(),
+      wakeupThrottleMs: 60_000,
+      wakeupTimeoutMs: 5,
+      logger,
+    });
+    processor.start();
+
+    await vi.waitFor(
+      () => {
+        expect(logger.debug).toHaveBeenCalledWith(
+          expect.objectContaining({
+            timeSinceLastWakeup: expect.any(Number),
+            wakeupTimeoutMs: 5,
+          }),
+          "fallback poll triggered - no wakeup signal received",
+        );
+      },
+      { timeout: 3000 },
+    );
+
+    await processor.stop();
+  });
+
+  it("skips fallback polling after a recent wakeup", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    mockClient.getEventsToProcess.mockResolvedValue([]);
+    const wakeup = createTestWakeupEmitter();
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 25,
+      wakeupEmitter: wakeup,
+      wakeupThrottleMs: 0,
+      wakeupTimeoutMs: 60_000,
+      logger,
+    });
+    processor.start();
+    await sleep(5);
+    wakeup.emitWakeup();
+    await sleep(35);
+
+    await vi.waitFor(
+      () => {
+        expect(logger.debug).toHaveBeenCalledWith(
+          expect.objectContaining({
+            timeSinceLastWakeup: expect.any(Number),
+            wakeupTimeoutMs: 60_000,
+          }),
+          "skipping fallback poll - wakeup signal received recently",
+        );
+      },
+      { timeout: 3000 },
+    );
+
+    await processor.stop();
+  });
+
+  it("unregisters the wakeup listener and cancels throttle timers on stop", async () => {
+    mockClient.getEventsToProcess.mockResolvedValue([]);
+    const wakeup = createTestWakeupEmitter();
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 100,
+      wakeupEmitter: wakeup,
+      wakeupThrottleMs: 50,
+    });
+    processor.start();
+    await sleep(20);
+    await processor.stop();
+
+    expect(wakeup.off).toHaveBeenCalled();
+  });
+
+  it("logs when the standard polling loop's sleep step fails unexpectedly", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    mockClient.getEventsToProcess.mockResolvedValue([]);
+    const sleepSpy = vi
+      .spyOn(sleepModule, "sleep")
+      .mockImplementationOnce(() => {
+        throw new Error("sleep interrupted");
+      });
+
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 10,
+      logger,
+    });
+    processor.start();
+
+    await vi.waitFor(
+      () => {
+        expect(logger.error).toHaveBeenCalledWith(
+          { error: expect.any(Error) },
+          "polling loop error",
+        );
+      },
+      { timeout: 2000 },
+    );
+
+    sleepSpy.mockRestore();
+    await processor.stop();
+  });
+
+  it("logs when the wakeup fallback loop's sleep step fails unexpectedly", async () => {
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    mockClient.getEventsToProcess.mockResolvedValue([]);
+    const sleepSpy = vi
+      .spyOn(sleepModule, "sleep")
+      .mockImplementationOnce(() => {
+        throw new Error("sleep interrupted");
+      });
+
+    const processor = new EventProcessor({
+      client: mockClient,
+      handlerMap: {},
+      pollingIntervalMs: 10,
+      wakeupEmitter: createTestWakeupEmitter(),
+      wakeupThrottleMs: 10,
+      wakeupTimeoutMs: 60_000,
+      logger,
+    });
+    processor.start();
+
+    await vi.waitFor(
+      () => {
+        expect(logger.error).toHaveBeenCalledWith(
+          { error: expect.any(Error) },
+          "fallback polling loop error",
+        );
+      },
+      { timeout: 2000 },
+    );
+
+    sleepSpy.mockRestore();
+    await processor.stop();
   });
 });
 
