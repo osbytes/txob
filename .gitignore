@@ -3,4 +3,4 @@ node_modules
 dist
 coverage
 *.tsbuildinfo
-tsconfig.tsbuildinfo
+tsconfig.tsbuildinfotest/prisma/generated

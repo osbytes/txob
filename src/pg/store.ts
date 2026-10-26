@@ -21,6 +21,23 @@ export interface PgPool extends PgQuerier {
   connect(): Promise<PgPoolClient>;
 }
 
+/**
+ * Runs txob's SQL through an ORM or driver. `TTx` is the transaction handle your app already
+ * uses, so `outbox.publish(tx, ...)` and `onDeliveryDead`'s `tx` are your ORM's own type.
+ * Statements use `$1`-style placeholders and only their rows are read.
+ *
+ * Ready-made adapters: `txob/pg/drizzle`, `txob/pg/kysely`, `txob/pg/prisma`,
+ * `txob/pg/postgres`, `txob/pg/sequelize`, `txob/pg/knex`, `txob/pg/typeorm`.
+ */
+export interface PgAdapter<TTx> {
+  /** Runs a statement outside any transaction. */
+  query(text: string, values: unknown[]): Promise<any[]>;
+  /** Runs a statement inside `tx`. */
+  queryIn(tx: TTx, text: string, values: unknown[]): Promise<any[]>;
+  /** Runs `fn` in a new transaction: commits if it resolves, rolls back if it throws. */
+  transaction<T>(fn: (tx: TTx) => Promise<T>): Promise<T>;
+}
+
 export type CreatePgStoreOpts = PgTableOpts & {
   /**
    * Used for claims and updates. Transactions (only needed when `onDeliveryDead` is set)
@@ -28,6 +45,39 @@ export type CreatePgStoreOpts = PgTableOpts & {
    */
   pool: PgPool;
 };
+
+export type CreatePgStoreAdapterOpts<TTx> = PgTableOpts & {
+  adapter: PgAdapter<TTx>;
+};
+
+/** Adapter for `pg` (or any driver with the same `Pool` shape). */
+export const pgPoolAdapter = (pool: PgPool): PgAdapter<PgQuerier> => ({
+  query: async (text, values) => (await pool.query(text, values)).rows,
+  queryIn: async (tx, text, values) => (await tx.query(text, values)).rows,
+  transaction: async (fn) => {
+    const client = await pool.connect();
+    let releaseErr: Error | undefined;
+    try {
+      await client.query("BEGIN");
+      try {
+        const result = await fn(client);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch((rollbackError: Error) => {
+          // Don't return a connection in an unknown transaction state to the pool
+          releaseErr = rollbackError;
+        });
+        throw error;
+      }
+    } finally {
+      client.release(releaseErr);
+    }
+  },
+});
+
+// Thrown inside a transaction to roll it back without failing the call
+class Rollback extends Error {}
 
 type DeliveryRow = {
   event_id: string;
@@ -54,11 +104,17 @@ const toDelivery = (row: DeliveryRow): TxOBDelivery => ({
   event: {
     id: row.event_id,
     type: row.type,
-    data: row.data,
+    data: toJson(row.data),
     correlation_id: row.correlation_id,
-    created_at: row.event_created_at,
+    created_at: toDate(row.event_created_at),
   },
 });
+
+// Some ORMs (e.g. Drizzle) return timestamps as strings and leave JSON unparsed
+const toDate = (value: Date | string): Date =>
+  value instanceof Date ? value : new Date(value);
+const toJson = (value: unknown) =>
+  typeof value === "string" ? JSON.parse(value) : value;
 
 const ms = (param: string) => `(${param}::float8 * interval '1 millisecond')`;
 
@@ -68,10 +124,16 @@ const ms = (param: string) => `(${param}::float8 * interval '1 millisecond')`;
  * Publish events with `outbox.publish(tx, ...)` where `tx` is the connection your
  * business transaction runs on (e.g. a `pg.PoolClient` after `BEGIN`).
  */
-export const createPgStore = (
-  opts: CreatePgStoreOpts,
-): TxOBStore<PgQuerier> => {
-  const { pool } = opts;
+export function createPgStore(opts: CreatePgStoreOpts): TxOBStore<PgQuerier>;
+export function createPgStore<TTx>(
+  opts: CreatePgStoreAdapterOpts<TTx>,
+): TxOBStore<TTx>;
+export function createPgStore<TTx>(
+  opts: CreatePgStoreOpts | CreatePgStoreAdapterOpts<TTx>,
+): TxOBStore<TTx> {
+  const db = (
+    "adapter" in opts ? opts.adapter : pgPoolAdapter(opts.pool)
+  ) as PgAdapter<TTx>;
   const { events, deliveries, rateLimitClaims } = resolveNames(opts);
 
   const leaseKeys = (items: TxOBDelivery[]) => [
@@ -167,25 +229,28 @@ UPDATE ${deliveries} SET
   run_after = COALESCE($4::timestamptz, run_after),
   completed_at = CASE WHEN $4::timestamptz IS NULL THEN now() END,
   lease_token = NULL,
-  last_error = $5::jsonb
-WHERE event_id = $1 AND handler = $2 AND lease_token = $3::uuid`;
+  last_error = $5::text::jsonb
+WHERE event_id = $1 AND handler = $2 AND lease_token = $3::uuid
+RETURNING 1`;
 
   return {
     insertEvent: async (tx, event) => {
-      await tx.query(
-        `INSERT INTO ${events} (id, type, data, correlation_id, created_at) VALUES ($1, $2, $3, $4, $5)`,
+      await db.queryIn(
+        tx,
+        `INSERT INTO ${events} (id, type, data, correlation_id, created_at) VALUES ($1, $2, $3::text::jsonb, $4, $5)`,
         [
           event.id,
           event.type,
           JSON.stringify(event.data),
           event.correlation_id,
-          event.created_at,
+          // ISO strings: some drivers (e.g. Drizzle on postgres.js) don't encode Dates
+          event.created_at.toISOString(),
         ],
       );
     },
 
     claimEventsForFanout: async ({ types, limit, leaseMs }) => {
-      const result = await pool.query(
+      const rows = await db.query(
         `
 UPDATE ${events} e SET
   fanout_run_after = now() + ${ms("$3")},
@@ -202,13 +267,17 @@ WHERE e.id = claimable.id
 RETURNING e.id, e.type, e.data, e.correlation_id, e.created_at, e.fanout_attempts, e.fanout_lease_token`,
         [types, limit, leaseMs],
       );
-      return result.rows as TxOBFanoutEvent[];
+      return rows.map((row) => ({
+        ...row,
+        data: toJson(row.data),
+        created_at: toDate(row.created_at),
+      })) as TxOBFanoutEvent[];
     },
 
     completeFanout: async ({ event_ids, deliveries: newDeliveries }) => {
       // Single statement, so delivery creation and marking events fanned out are atomic.
       // Re-running fan-out for an event is harmless: existing deliveries are kept.
-      await pool.query(
+      await db.query(
         `
 WITH inserted AS (
   INSERT INTO ${deliveries} (event_id, event_type, handler, priority, concurrency_key)
@@ -248,48 +317,34 @@ WHERE id = ANY($6::text[])`,
           s.rateLimit !== undefined,
       );
       if (limited.length === 0) {
-        const result = await pool.query(claimSql, params);
-        return (result.rows as DeliveryRow[]).map(toDelivery);
+        const rows = await db.query(claimSql, params);
+        return (rows as DeliveryRow[]).map(toDelivery);
       }
 
       // Limits are checked against deliveries leased by every processor. Claims for a limited
       // handler are serialized with a transaction-scoped advisory lock so two processors can't
       // both see the same free capacity. Locks are taken in a fixed order to avoid deadlocks.
-      const client = await pool.connect();
-      let releaseErr: Error | undefined;
-      try {
-        await client.query("BEGIN");
-        try {
-          await client.query(
-            `SELECT pg_advisory_xact_lock(hashtextextended(k, 0)) FROM (SELECT unnest($1::text[]) AS k ORDER BY 1) keys`,
-            [
-              limited.map(
-                (s) => `${lockNamespace}:${s.event_type}:${s.handler}`,
-              ),
-            ],
-          );
-          const result = await client.query(claimSql, params);
-          await client.query("COMMIT");
-          return (result.rows as DeliveryRow[]).map(toDelivery);
-        } catch (error) {
-          await client.query("ROLLBACK").catch((rollbackError: Error) => {
-            releaseErr = rollbackError;
-          });
-          throw error;
-        }
-      } finally {
-        client.release(releaseErr);
-      }
+      return db.transaction(async (tx) => {
+        await db.queryIn(
+          tx,
+          // Counted because some clients (Prisma) can't read the void lock results
+          `SELECT count(*)::int AS locked FROM (SELECT pg_advisory_xact_lock(hashtextextended(k, 0)) FROM (SELECT unnest($1::text[]) AS k ORDER BY 1) keys) locks`,
+          [limited.map((s) => `${lockNamespace}:${s.event_type}:${s.handler}`)],
+        );
+        const rows = await db.queryIn(tx, claimSql, params);
+        return (rows as DeliveryRow[]).map(toDelivery);
+      });
     },
 
     completeDelivery: async (delivery) => {
-      const result = await pool.query(
+      const rows = await db.query(
         `
 UPDATE ${deliveries} SET status = 'completed', completed_at = now(), lease_token = NULL
-WHERE event_id = $1 AND handler = $2 AND lease_token = $3::uuid`,
+WHERE event_id = $1 AND handler = $2 AND lease_token = $3::uuid
+RETURNING 1`,
         [delivery.event_id, delivery.handler, delivery.lease_token],
       );
-      return result.rowCount === 1;
+      return rows.length === 1;
     },
 
     failDelivery: async (delivery, failure, failOpts) => {
@@ -297,42 +352,30 @@ WHERE event_id = $1 AND handler = $2 AND lease_token = $3::uuid`,
         delivery.event_id,
         delivery.handler,
         delivery.lease_token,
-        failure.run_after,
+        failure.run_after?.toISOString() ?? null,
         JSON.stringify(failure.error),
       ];
       const within = failOpts?.within;
       if (!within) {
-        const result = await pool.query(failSql, params);
-        return result.rowCount === 1;
+        return (await db.query(failSql, params)).length === 1;
       }
 
-      const client = await pool.connect();
-      let releaseErr: Error | undefined;
       try {
-        await client.query("BEGIN");
-        try {
-          const result = await client.query(failSql, params);
-          if (result.rowCount !== 1) {
-            await client.query("ROLLBACK");
-            return false;
+        return await db.transaction(async (tx) => {
+          if ((await db.queryIn(tx, failSql, params)).length !== 1) {
+            throw new Rollback();
           }
-          await within(client);
-          await client.query("COMMIT");
+          await within(tx);
           return true;
-        } catch (error) {
-          await client.query("ROLLBACK").catch((rollbackError: Error) => {
-            // Don't return a connection in an unknown transaction state to the pool
-            releaseErr = rollbackError;
-          });
-          throw error;
-        }
-      } finally {
-        client.release(releaseErr);
+        });
+      } catch (error) {
+        if (error instanceof Rollback) return false;
+        throw error;
       }
     },
 
     extendLeases: async (items, { leaseMs }) => {
-      const result = await pool.query(
+      const rows = await db.query(
         `
 UPDATE ${deliveries} d SET run_after = now() + ${ms("$4")}
 FROM unnest($1::text[], $2::text[], $3::uuid[]) AS l (event_id, handler, lease_token)
@@ -342,14 +385,14 @@ RETURNING d.lease_token`,
       );
       // Match on the token: a stale and a current lease can share the same delivery key
       const extended = new Set(
-        result.rows.map((r: { lease_token: string }) => r.lease_token),
+        rows.map((r: { lease_token: string }) => r.lease_token),
       );
       return items.filter((d) => !extended.has(d.lease_token));
     },
 
     releaseDeliveries: async (items) => {
       if (items.length === 0) return;
-      await pool.query(
+      await db.query(
         `
 UPDATE ${deliveries} d SET run_after = now(), lease_token = NULL, attempts = GREATEST(d.attempts - 1, 0)
 FROM unnest($1::text[], $2::text[], $3::uuid[]) AS l (event_id, handler, lease_token)
@@ -358,4 +401,4 @@ WHERE d.event_id = l.event_id AND d.handler = l.handler AND d.lease_token = l.le
       );
     },
   };
-};
+}

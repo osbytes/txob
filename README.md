@@ -70,7 +70,8 @@ await db.transaction(async (tx) => {
 - ✅ **Horizontal scalability** - run any number of processors; claims use `FOR UPDATE SKIP LOCKED` and lease tokens fence out stale writers
 - ✅ **Near-realtime** - Postgres `LISTEN/NOTIFY` wakes processors immediately, with polling as a fallback
 - ✅ **Graceful shutdown** - in-flight handlers finish, and claimed-but-unstarted work is handed back
-- ✅ **Pluggable storage** - PostgreSQL, MongoDB, Redis/Valkey, DynamoDB and in-memory stores included, with recipes for their ORMs; implement `TxOBStore` for anything else
+- ✅ **Works with your ORM** - publish inside your existing transactions with Drizzle, Prisma, Kysely, postgres.js, Sequelize, Knex, TypeORM, ElectroDB, DynamoDB Toolbox or Dynamoose
+- ✅ **Pluggable storage** - PostgreSQL, MongoDB, Redis/Valkey, DynamoDB and in-memory stores included; implement `TxOBStore` for anything else
 - ✅ **OpenTelemetry-compatible** spans and metrics, without depending on an SDK
 
 ## Quick Start
@@ -345,7 +346,61 @@ const store = createPgStore({
 await migrate(pool, { schema: "app", tablePrefix: "txob_", channel: "txob" });
 ```
 
-`migrate` creates the `txob_events` and `txob_deliveries` tables, a small `txob_rate_limit_claims` log for rate-limited handlers, their indexes, and statement-level `AFTER INSERT` triggers that `pg_notify` the wakeup channel. If you manage schema with Prisma, Drizzle Kit, Knex, etc., put `getMigrationSql(opts)` in a migration instead.
+`migrate` creates the `txob_events` and `txob_deliveries` tables, a small `txob_rate_limit_claims` log for rate-limited handlers, their indexes, and statement-level `AFTER INSERT` triggers that `pg_notify` the wakeup channel. To create them with your ORM's migrations instead, see [ORMs and drivers](#orms-and-drivers).
+
+### ORMs and drivers
+
+Pass an `adapter` instead of a `pool`, and txob runs through your ORM. You then publish with your ORM's own transaction handle, and `onDeliveryDead` receives the same type:
+
+| Library                                             | Adapter                                                | Publish with                                       | Tables                          |
+| --------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------- | ------------------------------- |
+| [Drizzle](https://orm.drizzle.team)                 | `drizzleAdapter(db)` from `txob/pg/drizzle`            | `tx` from `db.transaction`                         | `txobTables()` for Drizzle Kit  |
+| [Kysely](https://kysely.dev)                        | `kyselyAdapter(db)` from `txob/pg/kysely`              | `trx` from `db.transaction().execute`              | `txobMigration()`               |
+| [Prisma](https://www.prisma.io)                     | `prismaAdapter(prisma)` from `txob/pg/prisma`          | `tx` from `prisma.$transaction(async (tx) => ...)` | migration SQL in its own schema |
+| [postgres.js](https://github.com/porsager/postgres) | `postgresAdapter(sql)` from `txob/pg/postgres`         | `sql` from `sql.begin`                             | `migrate`                       |
+| [Sequelize](https://sequelize.org)                  | `sequelizeAdapter(sequelize)` from `txob/pg/sequelize` | `t` from `sequelize.transaction(async (t) => ...)` | `txobMigration()`               |
+| [Knex](https://knexjs.org)                          | `knexAdapter(knex)` from `txob/pg/knex`                | `trx` from `knex.transaction`                      | `txobMigration()`               |
+| [TypeORM](https://typeorm.io)                       | `typeormAdapter(dataSource)` from `txob/pg/typeorm`    | `manager` from `dataSource.transaction`            | `txobMigration()`               |
+
+```typescript
+import { drizzle } from "drizzle-orm/node-postgres";
+import { createPgStore } from "txob/pg";
+import { drizzleAdapter } from "txob/pg/drizzle";
+
+const db = drizzle(pool);
+const store = createPgStore({ adapter: drizzleAdapter(db) });
+const outbox = createOutbox({ eventSchemas, store });
+
+await db.transaction(async (tx) => {
+  const [user] = await tx.insert(users).values(input).returning();
+  await outbox.publish(tx, "UserCreated", {
+    userId: user.id,
+    email: user.email,
+  });
+});
+```
+
+Every adapter passes the same store test suite as the plain `pg` store, including the cross-processor limit tests. Anything else that can run a parameterized query and open a transaction can implement the three-method `PgAdapter` interface.
+
+**Creating the tables** with your ORM's migration tooling, so txob's tables live in the same migration history as yours:
+
+- **Drizzle:** export the tables from your schema file, and Drizzle Kit generates them with your other tables. Drizzle Kit can't create triggers, so if you use a wakeup emitter, add `getWakeupTriggerStatements()` with `drizzle-kit generate --custom`.
+  ```typescript
+  // schema.ts
+  export const { txobEvents, txobDeliveries, txobRateLimitClaims } =
+    txobTables();
+  ```
+- **Prisma:** Prisma Migrate drops tables that `schema.prisma` doesn't model, and it can't model txob's partial indexes. Keep txob in a Postgres schema of its own, which Prisma leaves alone, and add the DDL as a migration:
+  ```bash
+  mkdir -p prisma/migrations/20260101000000_txob
+  node -e 'console.log(require("txob/pg").getMigrationSql({ schema: "txob" }))' \
+    > prisma/migrations/20260101000000_txob/migration.sql
+  ```
+  Then use `createPgStore({ adapter: prismaAdapter(prisma), schema: "txob" })`. `prismaAdapter(prisma, { transactionOptions: { timeout } })` raises Prisma's 5s interactive transaction timeout if `onDeliveryDead` does slow work.
+- **Kysely, Knex, Sequelize, TypeORM:** `txobMigration(opts)` returns a migration in each tool's format, e.g. `export const { up, down } = txobMigration()` for Kysely and Knex, `module.exports = txobMigration()` for sequelize-cli, or `migrations: [txobMigration()]` in a TypeORM `DataSource`.
+- **Anything else:** `migrate(poolOrAdapter, opts)` at startup, or `getMigrationSql(opts)` in a migration.
+
+`txob/pg` doesn't need the `pg` package unless you use `createPgStore({ pool })` or `createPgWakeupEmitter`. With postgres.js, `createPostgresWakeupEmitter(sql)` from `txob/pg/postgres` uses postgres.js's own `LISTEN`.
 
 `createPgWakeupEmitter` uses a dedicated connection for `LISTEN`; pass the same `channel` you migrated with. If the connection drops, processors keep polling; attach an `error` listener to be told about it.
 

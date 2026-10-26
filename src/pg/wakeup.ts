@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
-import { Client, escapeIdentifier, type ClientConfig } from "pg";
+import type { ClientConfig } from "pg";
 import type { WakeupEmitter } from "../types.js";
-import { defaultChannel } from "./schema.js";
+import { defaultChannel, escapeIdentifier } from "./schema.js";
 
 export type CreatePgWakeupEmitterOpts = {
   /** Config for the dedicated LISTEN connection. */
@@ -27,6 +27,9 @@ export const createPgWakeupEmitter = async (
   const channel = opts.channel ?? defaultChannel;
   const emitter = new EventEmitter();
 
+  // Loaded on use so txob/pg works without pg installed (e.g. with postgres.js)
+  const pg = await import("pg");
+  const Client = pg.Client ?? (pg as any).default.Client;
   const listenClient = new Client(opts.listenClientConfig);
   await listenClient.connect();
   await listenClient.query(`LISTEN ${escapeIdentifier(channel)}`);

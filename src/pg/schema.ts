@@ -1,5 +1,14 @@
-import { escapeIdentifier, escapeLiteral } from "pg";
-import type { PgQuerier } from "./store.js";
+import type { PgAdapter, PgQuerier } from "./store.js";
+
+// Same escaping as pg's helpers, without depending on the pg package
+export const escapeIdentifier = (name: string) =>
+  `"${name.replace(/"/g, '""')}"`;
+const escapeLiteral = (value: string) => {
+  const escaped = value.replace(/'/g, "''");
+  return value.includes("\\")
+    ? ` E'${escaped.replace(/\\/g, "\\\\")}'`
+    : `'${escaped}'`;
+};
 
 export type PgTableOpts = {
   /** Postgres schema for txob's tables. Default: unqualified (uses `search_path`). */
@@ -31,17 +40,15 @@ export const resolveNames = (opts: PgTableOpts = {}) => {
 };
 
 /**
- * Returns the DDL for txob's tables, indexes and wakeup triggers. Use this to add txob to
- * your own migration tooling (Prisma, Drizzle Kit, Knex, node-pg-migrate, ...), or call
- * `migrate` to run it directly. Requires Postgres 14+.
+ * The DDL for txob's tables and indexes, one statement per entry. Requires Postgres 14+.
  */
-export const getMigrationSql = (opts: PgMigrationOpts = {}): string => {
-  const { prefix, qualify, events, deliveries, rateLimitClaims } =
-    resolveNames(opts);
-  const channel = opts.channel ?? defaultChannel;
-  const notifyFn = qualify(`${prefix}notify`);
-
-  return `
+export const getTableStatements = (opts: PgTableOpts = {}): string[] => {
+  const { prefix, events, deliveries, rateLimitClaims } = resolveNames(opts);
+  return [
+    ...(opts.schema
+      ? [`CREATE SCHEMA IF NOT EXISTS ${escapeIdentifier(opts.schema)}`]
+      : []),
+    `
 CREATE TABLE IF NOT EXISTS ${events} (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
@@ -53,11 +60,11 @@ CREATE TABLE IF NOT EXISTS ${events} (
   -- when the event may next be fanned out; doubles as the fan-out lease expiry
   fanout_run_after TIMESTAMPTZ NOT NULL DEFAULT now(),
   fanout_lease_token UUID
-);
-
+)`,
+    `
 CREATE INDEX IF NOT EXISTS ${escapeIdentifier(`${prefix}events_fanout_idx`)}
-  ON ${events} (created_at) WHERE fanned_out_at IS NULL;
-
+  ON ${events} (created_at) WHERE fanned_out_at IS NULL`,
+    `
 CREATE TABLE IF NOT EXISTS ${deliveries} (
   event_id TEXT NOT NULL REFERENCES ${events} (id) ON DELETE CASCADE,
   event_type TEXT NOT NULL,
@@ -73,52 +80,99 @@ CREATE TABLE IF NOT EXISTS ${deliveries} (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ,
   PRIMARY KEY (event_id, handler)
-);
-
+)`,
+    `
 CREATE INDEX IF NOT EXISTS ${escapeIdentifier(`${prefix}deliveries_claim_idx`)}
-  ON ${deliveries} (event_type, handler, priority DESC, run_after) WHERE status = 'pending';
-
+  ON ${deliveries} (event_type, handler, priority DESC, run_after) WHERE status = 'pending'`,
+    `
 -- deliveries with a lease, counted for cross-processor concurrency limits
 CREATE INDEX IF NOT EXISTS ${escapeIdentifier(`${prefix}deliveries_leased_idx`)}
   ON ${deliveries} (event_type, handler, concurrency_key)
-  WHERE status = 'pending' AND lease_token IS NOT NULL;
-
+  WHERE status = 'pending' AND lease_token IS NOT NULL`,
+    `
 -- claim times of rate-limited handlers (sliding window log)
 CREATE TABLE IF NOT EXISTS ${rateLimitClaims} (
   event_type TEXT NOT NULL,
   handler TEXT NOT NULL,
   claimed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
+)`,
+    `
 CREATE INDEX IF NOT EXISTS ${escapeIdentifier(`${prefix}rate_limit_claims_idx`)}
-  ON ${rateLimitClaims} (event_type, handler, claimed_at);
+  ON ${rateLimitClaims} (event_type, handler, claimed_at)`,
+  ].map((statement) => statement.trim());
+};
 
+/**
+ * The DDL for the triggers that wake processors with NOTIFY when events or deliveries are
+ * inserted, one statement per entry. Add these with a custom migration if your ORM generates
+ * the table definitions (Drizzle Kit, Prisma Migrate).
+ */
+export const getWakeupTriggerStatements = (
+  opts: PgMigrationOpts = {},
+): string[] => {
+  const { prefix, qualify, events, deliveries } = resolveNames(opts);
+  const channel = opts.channel ?? defaultChannel;
+  const notifyFn = qualify(`${prefix}notify`);
+  return [
+    `
 CREATE OR REPLACE FUNCTION ${notifyFn}() RETURNS TRIGGER AS $$
 BEGIN
   PERFORM pg_notify(${escapeLiteral(channel)}, TG_TABLE_NAME);
   RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
-
+$$ LANGUAGE plpgsql`,
+    `
 CREATE OR REPLACE TRIGGER ${escapeIdentifier(`${prefix}events_notify`)}
-  AFTER INSERT ON ${events} FOR EACH STATEMENT EXECUTE FUNCTION ${notifyFn}();
-
+  AFTER INSERT ON ${events} FOR EACH STATEMENT EXECUTE FUNCTION ${notifyFn}()`,
+    `
 CREATE OR REPLACE TRIGGER ${escapeIdentifier(`${prefix}deliveries_notify`)}
-  AFTER INSERT ON ${deliveries} FOR EACH STATEMENT EXECUTE FUNCTION ${notifyFn}();
-`;
+  AFTER INSERT ON ${deliveries} FOR EACH STATEMENT EXECUTE FUNCTION ${notifyFn}()`,
+  ].map((statement) => statement.trim());
+};
+
+/** Drops txob's tables, wakeup triggers and function (not the schema), for a down migration. */
+export const getDropStatements = (opts: PgTableOpts = {}): string[] => {
+  const { prefix, qualify, events, deliveries, rateLimitClaims } =
+    resolveNames(opts);
+  return [
+    `DROP TABLE IF EXISTS ${deliveries}, ${events}, ${rateLimitClaims}`,
+    `DROP FUNCTION IF EXISTS ${qualify(`${prefix}notify`)}()`,
+  ];
 };
 
 /**
- * Creates txob's tables, indexes and wakeup triggers if they don't exist.
- * Serialized with an advisory lock so concurrent processes can call it at startup.
+ * Returns the DDL for txob's tables, indexes and wakeup triggers. Use this to add txob to
+ * your own migration tooling (Prisma, Drizzle Kit, Knex, node-pg-migrate, ...), or call
+ * `migrate` to run it directly. Requires Postgres 14+.
+ */
+export const getMigrationSql = (opts: PgMigrationOpts = {}): string =>
+  [...getTableStatements(opts), ...getWakeupTriggerStatements(opts)]
+    .map((statement) => `${statement};\n`)
+    .join("\n");
+
+/**
+ * Creates txob's tables, indexes and wakeup triggers if they don't exist, with a `pg` pool or
+ * client or a `PgAdapter`. Serialized with an advisory lock so concurrent processes can call
+ * it at startup.
  */
 export const migrate = async (
-  querier: PgQuerier,
+  target: PgQuerier | PgAdapter<any>,
   opts: PgMigrationOpts = {},
 ): Promise<void> => {
+  const statements = [
+    `SELECT count(*)::int FROM (SELECT pg_advisory_xact_lock(hashtext('txob_migrate'))) l`,
+    ...getTableStatements(opts),
+    ...getWakeupTriggerStatements(opts),
+  ];
+  if ("queryIn" in target) {
+    await target.transaction(async (tx) => {
+      for (const statement of statements) {
+        await target.queryIn(tx, statement, []);
+      }
+    });
+    return;
+  }
   // A multi-statement query without parameters runs in a single implicit transaction,
   // so the transaction-scoped advisory lock is held until all DDL is applied.
-  await querier.query(
-    `SELECT pg_advisory_xact_lock(hashtext('txob_migrate'));\n${getMigrationSql(opts)}`,
-  );
+  await target.query(statements.map((statement) => `${statement};`).join("\n"));
 };

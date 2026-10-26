@@ -49,6 +49,9 @@ jobs:
           docker run -d --name redis -p 6379:6379 redis:8-alpine
           docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:latest
 
+      - name: Generate Prisma Client for the adapter tests
+        run: yarn test:prepare
+
       - name: Typecheck
         run: yarn typecheck
 
