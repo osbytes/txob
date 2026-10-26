@@ -682,6 +682,14 @@ UserCreated: {
 - throughput exceeds what your database can absorb in writes
 - you need fan-out to many independent consumer services (a message broker; txob can feed one)
 
+## Contributing
+
+Run `yarn test` for unit tests and the in-memory store. The store tests run against real databases when their URL is set: `TXOB_TEST_PG_URL`, `TXOB_TEST_MONGO_URL` (a replica set), `TXOB_TEST_REDIS_URL` and `TXOB_TEST_DYNAMODB_URL` (see `.github/workflows/coverage.yml` for the containers). Run `yarn test:prepare` first to generate the Prisma Client the ORM adapter tests use.
+
+If your change affects users, add a changeset with `yarn changeset`: pick patch, minor or major, and describe the change for the changelog.
+
+**Releasing** is automated with [Changesets](https://github.com/changesets/changesets). When changesets land on `main`, the release workflow opens a "Version Packages" PR that bumps the version and updates `CHANGELOG.md`. Merging that PR publishes to npm with provenance and creates a GitHub release.
+
 ## License
 
 MIT

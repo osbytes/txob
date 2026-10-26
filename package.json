@@ -30,7 +30,7 @@
     "type": "git",
     "url": "git://github.com/osbytes/txob.git"
   },
-  "version": "0.5.0",
+  "version": "0.4.0",
   "type": "module",
   "license": "MIT",
   "files": [
@@ -120,7 +120,10 @@
     "format": "prettier -w .",
     "typecheck": "tsc -p tsconfig.test.json",
     "mark:cjs": "node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({ type: 'commonjs' }))\"",
-    "test:prepare": "prisma generate --schema test/prisma/schema.prisma"
+    "test:prepare": "prisma generate --schema test/prisma/schema.prisma",
+    "changeset": "changeset",
+    "version-packages": "changeset version && prettier -w CHANGELOG.md",
+    "release": "changeset publish"
   },
   "dependencies": {
     "@standard-schema/spec": "^1.1.0",
@@ -143,6 +146,8 @@
     "@aws-sdk/client-dynamodb": "^3",
     "@aws-sdk/lib-dynamodb": "^3",
     "@aws-sdk/util-dynamodb": "^3",
+    "@changesets/changelog-github": "^0",
+    "@changesets/cli": "^2",
     "@prisma/adapter-pg": "^7.10.1",
     "@prisma/client": "^7.10.1",
     "@types/node": "^25.0.3",
@@ -226,5 +231,9 @@
   },
   "engines": {
     "node": ">=20.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }
