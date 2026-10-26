@@ -1,21 +1,32 @@
 import { z } from "zod";
-import type { TxOBEventSchemaMap } from "../../src/index.js";
-
-export const eventTypes = {
-  ResourceSaved: "ResourceSaved",
-  EventMaxErrorsReached: "EventMaxErrorsReached",
-} as const;
-
-export type EventType = keyof typeof eventTypes;
+import { createOutbox } from "../../src/index.js";
+import { createPgStore } from "../../src/pg/index.js";
+import pg from "pg";
+import dotenv from "dotenv";
+dotenv.config();
 
 export const eventSchemas = {
-  [eventTypes.ResourceSaved]: z.object({
+  ResourceSaved: z.object({
     type: z.literal("activity"),
     id: z.uuid(),
+    accountId: z.string(),
   }),
-  [eventTypes.EventMaxErrorsReached]: z.object({
-    failedEventId: z.uuid(),
-    failedEventType: z.string(),
-    failedEventCorrelationId: z.uuid(),
+  DeliveryDead: z.object({
+    eventId: z.string(),
+    eventType: z.string(),
+    handler: z.string(),
+    error: z.string(),
   }),
-} satisfies TxOBEventSchemaMap<EventType>;
+};
+
+export const pool = new pg.Pool({
+  user: process.env.POSTGRES_USER || "outbox",
+  password: process.env.POSTGRES_PASSWORD || "outbox",
+  database: process.env.POSTGRES_DB || "outbox",
+  port: parseInt(process.env.POSTGRES_PORT || "5434"),
+  max: 30,
+});
+
+export const store = createPgStore({ pool });
+
+export const outbox = createOutbox({ eventSchemas, store });

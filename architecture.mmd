@@ -1,72 +1,39 @@
 graph TB
     subgraph Application["Your Application"]
-        AppTx["BEGIN TRANSACTION"]
-        AppData["1. Insert/Update business data<br/>(users, orders, etc.)"]
-        AppEvent["2. Insert event record"]
-        AppCommit["COMMIT TRANSACTION"]
-        
-        AppTx --> AppData
-        AppData --> AppEvent
-        AppEvent --> AppCommit
+        AppTx["BEGIN"]
+        AppData["Write business data"]
+        AppPublish["outbox.publish(tx, type, data)<br/>validates with the event's schema"]
+        AppCommit["COMMIT"]
+        AppTx --> AppData --> AppPublish --> AppCommit
     end
-    
-    subgraph Database["Database"]
-        EventsTable[("Events Table<br/>id, type, data,<br/>processed_at, errors,<br/>backoff_until")]
-        
-        AppCommit -->|"Both saved atomically ✅"| EventsTable
+
+    subgraph Database["Store (Postgres, MongoDB, Redis, DynamoDB, ...)"]
+        Events[("txob_events<br/>id, type, data, correlation_id<br/>fanned_out_at, fanout lease")]
+        Deliveries[("txob_deliveries<br/>one per (event, handler)<br/>status, attempts, priority,<br/>concurrency_key, run_after,<br/>lease_token, last_error")]
+        Notify["Wakeup source<br/>pg_notify, change stream, pub/sub"]
     end
-    
-    subgraph WakeupSignals["Wakeup Signals (Optional)"]
-        direction TB
-        PGTrigger["PostgreSQL Trigger<br/>(auto-created)"]
-        PGNotify["PostgreSQL NOTIFY<br/>(LISTEN connection)"]
-        MongoStream["MongoDB Change Streams<br/>(watches for inserts)"]
-        
-        EventsTable -->|"INSERT triggers"| PGTrigger
-        PGTrigger -->|"sends NOTIFY"| PGNotify
-        EventsTable -->|"INSERT operations"| MongoStream
+
+    AppCommit -->|"atomically with business data"| Events
+    Events --> Notify
+    Deliveries --> Notify
+
+    subgraph Processor["Event Processor (run N for scale)"]
+        Wakeup["Wakeup emitter<br/>(optional; polling otherwise)"]
+        Poll["Poll (interval, wakeup,<br/>completion, backoff timers)"]
+        Fanout["Fan-out<br/>lease unfanned events of handled types,<br/>create deliveries + mark fanned out<br/>(one statement, idempotent)"]
+        Claim["Claim deliveries, priority order<br/>within limits counted across ALL processors:<br/>concurrency, per-key concurrency, rate limit<br/>(serialized per limited handler),<br/>set lease + token, attempts+1"]
+        Run["Run handler<br/>signal aborted on: shutdown | timeoutMs | lease lost<br/>handler's own result decides the outcome"]
+        Heartbeat["Heartbeat<br/>renew leases every leaseMs/3"]
+        Record["Record result (fenced by lease token)<br/>completed | retry with backoff | dead"]
+        DeadHook["onDeliveryDead<br/>(same transaction, can publish)"]
     end
-    
-    subgraph Polling["Polling Component<br/>(Decoupled from Processing)"]
-        direction TB
-        WakeupListener["Wakeup Signal Listener<br/>(on 'wakeup' event)"]
-        ThrottledPoll["Throttled Poll Function<br/>(leading + trailing edge)<br/>Prevents excessive polling"]
-        FallbackLoop["Fallback Polling Loop<br/>(runs periodically)"]
-        TimeoutCheck["Check: time since last wakeup<br/>> wakeupTimeoutMs?"]
-        
-        PGNotify -->|"emits 'wakeup'"| WakeupListener
-        MongoStream -->|"emits 'wakeup'"| WakeupListener
-        WakeupListener -->|"triggers"| ThrottledPoll
-        FallbackLoop -->|"waits pollingIntervalMs"| TimeoutCheck
-        TimeoutCheck -->|"yes: no recent wakeup"| ThrottledPoll
-        TimeoutCheck -->|"no: recent wakeup"| FallbackLoop
-    end
-    
-    subgraph Processing["Processing Queue & Processor"]
-        direction TB
-        PollQuery["getEventsToProcess()<br/>SELECT unprocessed events<br/>(FOR UPDATE SKIP LOCKED)"]
-        EventQueue["Processing Queue<br/>(PQueue with concurrency limit)"]
-        ProcessEvent["processEvent()"]
-        LockEvent["Lock event in transaction<br/>(getEventByIdForUpdateSkipLocked)"]
-        ExecuteHandlers["Execute handlers concurrently<br/>(pLimit for handler concurrency)<br/>send email, webhook, etc."]
-        UpdateEvent["updateEvent()<br/>UPDATE with results & processed_at"]
-        ErrorHandling["On failure:<br/>increment errors,<br/>set backoff_until"]
-        
-        ThrottledPoll -->|"calls"| PollQuery
-        PollQuery -->|"returns event IDs"| EventQueue
-        EventQueue -->|"queues for processing"| ProcessEvent
-        ProcessEvent --> LockEvent
-        LockEvent -->|"event locked"| ExecuteHandlers
-        ExecuteHandlers -->|"all handlers complete"| UpdateEvent
-        ExecuteHandlers -->|"handler fails"| ErrorHandling
-        ErrorHandling --> UpdateEvent
-        UpdateEvent -->|"commits transaction"| EventsTable
-    end
-    
-    EventsTable -->|"queries for<br/>unprocessed events"| PollQuery
-    
-    style Application fill:#e1f5ff
-    style Database fill:#fff4e1
-    style WakeupSignals fill:#f0f4ff
-    style Polling fill:#e8f5e9
-    style Processing fill:#fce4ec
+
+    Notify --> Wakeup --> Poll
+    Poll --> Fanout --> Claim
+    Events -.-> Fanout
+    Fanout -.-> Deliveries
+    Deliveries -.-> Claim
+    Claim --> Run --> Record
+    Heartbeat -.->|"extend leases"| Deliveries
+    Record -->|"dead"| DeadHook
+    Record -.-> Deliveries

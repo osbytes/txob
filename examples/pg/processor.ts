@@ -1,129 +1,110 @@
-import pg from "pg";
-import { randomUUID } from "node:crypto";
 import {
   createEventHandlerMap,
   createEventProcessor,
-  type TxOBProcessor,
-  WakeupEmitter,
+  TxOBError,
 } from "../../src/index.js";
-import {
-  createProcessorClient,
-  createWakeupEmitter,
-} from "../../src/pg/client.js";
-import { eventSchemas, eventTypes } from "./events.js";
-import { migrate } from "./server.js";
-import dotenv from "dotenv";
+import { createPgWakeupEmitter, migrate } from "../../src/pg/index.js";
+import { eventSchemas, pool, store } from "./events.js";
 import { sleep } from "../../src/sleep.js";
-dotenv.config();
 
-let processor: TxOBProcessor | undefined = undefined;
-let wakeupEmitter: WakeupEmitter | undefined = undefined;
+await migrate(pool);
 
-(async () => {
-  const clientConfig: pg.ClientConfig = {
-    user: process.env.POSTGRES_USER || 'outbox',
-    password: process.env.POSTGRES_PASSWORD || 'outbox',
-    database: process.env.POSTGRES_DB || 'outbox',
+const wakeupEmitter = await createPgWakeupEmitter({
+  listenClientConfig: {
+    user: process.env.POSTGRES_USER || "outbox",
+    password: process.env.POSTGRES_PASSWORD || "outbox",
+    database: process.env.POSTGRES_DB || "outbox",
     port: parseInt(process.env.POSTGRES_PORT || "5434"),
-  };
-  const client = new pg.Client(clientConfig);
-  await client.connect();
-  await migrate(client);
+  },
+});
 
-  wakeupEmitter = await createWakeupEmitter({
-    listenClientConfig: clientConfig,
-    createTrigger: true,
-    querier: client,
-  });
+const handlerMap = createEventHandlerMap({
+  eventSchemas,
+  handlerMap: {
+    ResourceSaved: {
+      // A plain function uses the defaults: 5 attempts with exponential backoff
+      audit: async (event) => {
+        console.log(
+          `${event.id} audit ${event.correlation_id} activity=${event.data.id}`,
+        );
+      },
 
-  const handlerMap = createEventHandlerMap({
-    eventSchemas,
-    handlerMap: {
-      ResourceSaved: {
-        thing1: async (event) => {
-          console.log(
-            `${event.id} thing1 ${event.correlation_id} activity=${event.data.id}`,
-          );
-          if (Math.random() > 0.99) throw new Error("some issue");
+      // Calls a rate-limited third party: at most 10 starts per second, 3 at a time
+      syncCrm: {
+        concurrency: 3,
+        rateLimit: { max: 10, durationMs: 1_000 },
+        retry: { maxAttempts: 8 },
+        timeoutMs: 5_000,
+        handler: async (event, { signal, attempt }) => {
+          await sleep(Math.random() * 200, signal);
+          if (Math.random() > 0.9) {
+            throw new TxOBError("crm throttled", {
+              backoffUntil: new Date(Date.now() + 2_000),
+            });
+          }
+          console.log(`${event.id} syncCrm attempt=${attempt}`);
         },
-        thing2: async (event) => {
-          console.log(
-            `${event.id} thing2 ${event.correlation_id} kind=${event.data.type}`,
-          );
-          if (Math.random() > 0.96) throw new Error("some issue");
+      },
+
+      // Per-account updates must not race: one at a time per account, accounts in parallel
+      updateAccountStats: {
+        concurrency: {
+          perKey: { key: (event) => event.data.accountId, limit: 1 },
         },
-        thing3: async (event) => {
-          await sleep(Math.random() * 1_000);
-          console.log(`${event.id} thing3 ${event.correlation_id}`);
+        priority: (event) => (event.data.accountId === "acct-0" ? 10 : 0),
+        handler: async (event) => {
+          await sleep(Math.random() * 500);
           if (Math.random() > 0.8) throw new Error("some issue");
-        },
-      },
-      EventMaxErrorsReached: {
-        // Optional: add handlers for EventMaxErrorsReached events if needed
-        // For example, you might want to send alerts or log to external systems
-        notify: async (event) => {
-          console.log(
-            "Event max errors reached",
-            event.data.failedEventType,
-            event.data.failedEventId,
-          );
+          console.log(`${event.id} updateAccountStats ${event.data.accountId}`);
         },
       },
     },
-  });
-
-  processor = createEventProcessor({
-    eventSchemas,
-    maxEventConcurrency: 50,
-    client: createProcessorClient({ querier: client, eventSchemas }),
-    wakeupEmitter,
-    handlerMap,
-    pollingIntervalMs: 5000,
-    logger: {
-      info: console.log,
-      error: console.error,
-      warn: console.warn,
-      debug: () => { },
+    DeliveryDead: {
+      alert: async (event) => {
+        console.log("delivery dead", event.data);
+      },
     },
-    onEventMaxErrorsReached: async ({ event, txClient }) => {
-      // Transactionally persist an 'event max errors reached' event
-      // This hook is called when:
-      // - Maximum allowed errors are reached
-      // - An unprocessable error is encountered
-      // - Event handler map is missing for the event type
+  },
+});
 
-      await txClient.createEvent({
-        id: randomUUID(),
-        timestamp: new Date(),
-        type: eventTypes.EventMaxErrorsReached,
-        data: eventSchemas.EventMaxErrorsReached.parse({
-          failedEventId: event.id,
-          failedEventType: event.type,
-          failedEventCorrelationId: event.correlation_id,
-        }),
-        correlation_id: event.correlation_id,
-        handler_results: {},
-        errors: 0,
-      });
-
-      console.log("Event max errors reached event created", {
-        failedEventId: event.id,
-      });
-    },
-  });
-  processor.start();
-})();
+const processor = createEventProcessor({
+  store,
+  eventSchemas,
+  handlerMap,
+  concurrency: 50,
+  wakeupEmitter,
+  logger: {
+    info: console.log,
+    error: console.error,
+    warn: console.warn,
+    debug: () => {},
+  },
+  // Runs in the same transaction that marks the delivery dead
+  onDeliveryDead: async ({ event, handler, error, publish }) => {
+    await publish(
+      "DeliveryDead",
+      {
+        eventId: event.id,
+        eventType: event.type,
+        handler,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      { correlation_id: event.correlation_id },
+    );
+  },
+});
+processor.start();
 
 const shutdown = (() => {
   let shutdownStarted = false;
   return async () => {
     if (shutdownStarted) return;
-
     shutdownStarted = true;
 
     try {
-      await processor?.stop();
-      await wakeupEmitter?.close();
+      await processor.stop();
+      await wakeupEmitter.close();
+      await pool.end();
     } catch (err) {
       console.error(err);
       process.exit(1);
@@ -131,5 +112,5 @@ const shutdown = (() => {
     process.exit(0);
   };
 })();
-process.once("SIGTERM", shutdown);
-process.once("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
