@@ -1044,7 +1044,7 @@ export const runStoreContract = <TTx>(
           ...baseHandlers,
           UserCreated: {
             limited: {
-              rateLimit: { max: 2, durationMs: 300 },
+              rateLimit: { max: 2, durationMs: 1_000 },
               handler: async () => void startedAt.push(Date.now()),
             },
           },
@@ -1053,13 +1053,14 @@ export const runStoreContract = <TTx>(
         await publishUsers(6);
         await waitFor(
           async () => (await deliveriesBy("completed")).length === 6,
+          { timeoutMs: 10_000 },
         );
         startedAt.sort((a, b) => a - b);
         for (let i = 2; i < startedAt.length; i++) {
           // The store limits claims; a handler can start a little after its claim
-          expect(startedAt[i] - startedAt[i - 2]).toBeGreaterThanOrEqual(250);
+          expect(startedAt[i] - startedAt[i - 2]).toBeGreaterThanOrEqual(800);
         }
-      });
+      }, 15_000);
 
       it("runs higher priority deliveries first", async () => {
         const order: string[] = [];
