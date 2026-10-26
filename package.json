@@ -30,7 +30,7 @@
     "type": "git",
     "url": "git://github.com/osbytes/txob.git"
   },
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "license": "MIT",
   "files": [
