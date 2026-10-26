@@ -306,6 +306,8 @@ createEventProcessor({
 
 If the hook throws, the transaction rolls back and the delivery is retried after its lease expires.
 
+Like any transaction callback, the hook can run more than once: when the hook throws, when a MongoDB transaction hits a transient error, or when a Redis `WATCH` sees a concurrent change. Only one run commits, so keep side effects inside `tx` and `publish`.
+
 ## Processor Options
 
 | Option              | Default  | Description                                                            |

@@ -147,12 +147,12 @@ export const runStoreContract = <TTx>(
         const first = await h.store.claimEventsForFanout({
           types,
           limit: 2,
-          leaseMs: 200,
+          leaseMs: 1_000,
         });
         const second = await h.store.claimEventsForFanout({
           types,
           limit: 10,
-          leaseMs: 200,
+          leaseMs: 1_000,
         });
         expect(first).toHaveLength(2);
         expect(second).toHaveLength(1);
@@ -160,22 +160,22 @@ export const runStoreContract = <TTx>(
           await h.store.claimEventsForFanout({
             types,
             limit: 10,
-            leaseMs: 200,
+            leaseMs: 1_000,
           }),
         ).toHaveLength(0);
         expect(
           await h.store.claimEventsForFanout({
             types: ["OrderPlaced"],
             limit: 10,
-            leaseMs: 200,
+            leaseMs: 1_000,
           }),
         ).toHaveLength(0);
 
-        await delay(250);
+        await delay(1_100);
         const reclaimed = await h.store.claimEventsForFanout({
           types,
           limit: 10,
-          leaseMs: 200,
+          leaseMs: 1_000,
         });
         expect(reclaimed).toHaveLength(3);
         expect(reclaimed.every((e) => e.fanout_attempts === 2)).toBe(true);
@@ -504,18 +504,18 @@ export const runStoreContract = <TTx>(
         const claimed = await h.store.claimDeliveries({
           slots,
           limit: 50,
-          leaseMs: 200,
+          leaseMs: 1_000,
         });
         expect(claimed).toHaveLength(40);
         for (let round = 0; round < 3; round++) {
-          expect(await h.store.extendLeases(claimed, { leaseMs: 200 })).toEqual(
-            [],
-          );
-          await delay(100);
+          expect(
+            await h.store.extendLeases(claimed, { leaseMs: 1_000 }),
+          ).toEqual([]);
+          await delay(400);
         }
-        // Still held 300ms after claiming with a 200ms lease
+        // Still held 1.2s after claiming with a 1s lease
         expect(
-          await h.store.claimDeliveries({ slots, limit: 50, leaseMs: 200 }),
+          await h.store.claimDeliveries({ slots, limit: 50, leaseMs: 1_000 }),
         ).toHaveLength(0);
       });
 
@@ -582,15 +582,15 @@ export const runStoreContract = <TTx>(
           },
         ];
         expect(
-          await h.store.claimDeliveries({ slots, limit: 10, leaseMs: 100 }),
+          await h.store.claimDeliveries({ slots, limit: 10, leaseMs: 500 }),
         ).toHaveLength(1);
         expect(
-          await h.store.claimDeliveries({ slots, limit: 10, leaseMs: 100 }),
+          await h.store.claimDeliveries({ slots, limit: 10, leaseMs: 500 }),
         ).toHaveLength(0);
         // The holder "crashes": its lease lapses and the slot opens up
-        await delay(150);
+        await delay(600);
         expect(
-          await h.store.claimDeliveries({ slots, limit: 10, leaseMs: 100 }),
+          await h.store.claimDeliveries({ slots, limit: 10, leaseMs: 500 }),
         ).toHaveLength(1);
       });
 
@@ -1042,7 +1042,7 @@ export const runStoreContract = <TTx>(
           ...baseHandlers,
           UserCreated: {
             limited: {
-              rateLimit: { max: 2, durationMs: 100 },
+              rateLimit: { max: 2, durationMs: 300 },
               handler: async () => void startedAt.push(Date.now()),
             },
           },
@@ -1054,8 +1054,8 @@ export const runStoreContract = <TTx>(
         );
         startedAt.sort((a, b) => a - b);
         for (let i = 2; i < startedAt.length; i++) {
-          // Allow for clock granularity between the store and the handler
-          expect(startedAt[i] - startedAt[i - 2]).toBeGreaterThanOrEqual(90);
+          // The store limits claims; a handler can start a little after its claim
+          expect(startedAt[i] - startedAt[i - 2]).toBeGreaterThanOrEqual(250);
         }
       });
 

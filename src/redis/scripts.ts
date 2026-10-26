@@ -381,12 +381,13 @@ for i = 3, #ARGV, 2 do
   if redis.call('HGET', dk, 'lease_token') ~= token then
     table.insert(lost, (i - 3) / 2)
   else
-    -- An expired lease that nobody reclaimed yet is still ours; take it off the ready queue
-    detach(dk, id)
-    local f = redis.call('HMGET', dk, 'event_type', 'handler', 'concurrency_key')
+    -- An expired lease that nobody reclaimed yet is still ours; take it off the ready queue.
+    -- The delivery hash is left alone otherwise: a dead-delivery hook WATCHes it, and a
+    -- renewal shouldn't make that transaction retry.
+    local f = redis.call('HMGET', dk, 'event_type', 'handler', 'concurrency_key', 'ready_member')
+    if f[4] then detach(dk, id) end
     redis.call('ZADD', slot_key('leased', f[1], f[2]), expires, id)
     if f[3] then redis.call('ZADD', key_key(f[1], f[2], f[3]), expires, id) end
-    redis.call('HSET', dk, 'run_after', expires)
   end
 end
 return lost
