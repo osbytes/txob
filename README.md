@@ -13,7 +13,7 @@
     <img src="https://codecov.io/gh/osbytes/txob/graph/badge.svg?token=E9M7G67VLL"/>
   </a>
   <a aria-label="NPM version" href="https://www.npmjs.com/package/txob">
-    <img alt="" src="https://badgen.net/npm/v/txob?v=0.4.0">
+    <img alt="" src="https://badgen.net/npm/v/txob">
   </a>
   <a aria-label="License" href="https://github.com/osbytes/txob/blob/main/LICENSE">
     <img alt="" src="https://badgen.net/npm/license/txob">
@@ -26,135 +26,161 @@
   </a>
 </p>
 
----
+> **txob 0.5** reworks the processing model and is not backwards compatible. Coming from 0.4? See [MIGRATING.md](./MIGRATING.md).
 
 ## The Problem
 
-When building applications, you often need to perform multiple operations together: update your database AND send an email, publish an event, trigger a webhook, or notify another service. This creates a critical challenge:
+When building applications, you often need to perform multiple operations together: update your database AND send an email, publish an event, trigger a webhook, or notify another service.
 
 ```typescript
-// ❌ The problem: What if the email fails after the database commit?
+// ❌ What if the email fails after the database commit?
 await db.createUser(user);
 await db.commit();
-await emailService.sendWelcomeEmail(user.email); // 💥 Fails! User created but no email sent
-```
+await emailService.sendWelcomeEmail(user.email); // 💥 User created, no email sent
 
-```typescript
-// ❌ Also problematic: What if the database fails after sending the email?
-await emailService.sendWelcomeEmail(user.email); // ✅ Email sent
-await db.createUser(user);
-await db.commit(); // 💥 Fails! Email sent but no user record
-```
-
-```typescript
-// ❌ What about using a message queue?
+// ❌ What about a message queue?
 await db.createUser(user);
 await messageQueue.publish("user.created", user); // ✅ Message queued
-await db.commit(); // 💥 Fails! Message is in queue but no user record
-// The queue and database are separate systems - you can't make them atomic!
+await db.commit(); // 💥 Message is in the queue but there's no user record
 ```
 
-**The Transactional Outbox Pattern** solves this by storing both the business data and events in a single database transaction, then processing events asynchronously with guaranteed delivery.
+The queue and the database are separate systems; you can't make them atomic.
+
+**The Transactional Outbox Pattern** solves this by writing the event in the same database transaction as your business data, then delivering it to handlers asynchronously with retries.
 
 ```typescript
-// ✅ Solution: Save both user and event in the same transaction
-await db.query("BEGIN");
-
-// Save your business data
-await db.query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)", [
-  userId,
-  email,
-  name,
-]);
-
-// Save the event in the SAME transaction
-await db.query(
-  "INSERT INTO events (id, type, data, correlation_id, handler_results, errors) VALUES ($1, $2, $3, $4, $5, $6)",
-  [randomUUID(), "UserCreated", { userId, email }, correlationId, {}, 0],
-);
-
-await db.query("COMMIT");
-// ✅ Both user and event are saved atomically!
-// If commit fails, neither is saved. If it succeeds, both are saved.
-// The processor will pick up the event and send the email (and any other side effects that you register) asynchronously
+// ✅ Both commit, or neither does
+await db.transaction(async (tx) => {
+  await createUser(tx, user);
+  await outbox.publish(tx, "UserCreated", {
+    userId: user.id,
+    email: user.email,
+  });
+});
+// A processor delivers UserCreated to every registered handler, retrying until each succeeds
 ```
 
 ## Features
 
-- ✅ **At-least-once delivery** - Events are never lost, even during failures or crashes
-- ✅ **Graceful shutdown** - Finish processing in-flight events before shutting down
-- ✅ **Horizontal scalability** - Run multiple processors without conflicts using row-level locking
-- ✅ **Database agnostic** - Built-in support for PostgreSQL and MongoDB, or implement your own
-- ✅ **Near-realtime delivery** - Optional wakeup signals (Postgres NOTIFY, MongoDB Change Streams) trigger immediate processing when events are inserted, with polling as a fallback
-- ✅ **Configurable error handling** - Exponential backoff, max retries, and custom error hooks
-- ✅ **TypeScript-first** - Full type safety and autocompletion
-- ✅ **Handler result tracking** - Track the execution status of each handler independently
-- ✅ **Minimal dependencies** - Only `p-limit` and `p-queue` (plus your database driver)
+- ✅ **At-least-once delivery** - events commit with your data and are never lost, even through crashes
+- ✅ **Typed events** - define events with any [Standard Schema](https://standardschema.dev) library (Zod, Valibot, ArkType, ...); payloads are validated on publish and typed in handlers
+- ✅ **Independent handlers** - each handler of an event is its own delivery with its own retries, so one failing side effect never re-runs the others
+- ✅ **Concurrency controls that hold across processors** - per-handler concurrency limits, per-key concurrency (e.g. one at a time per account) and rate limits are enforced across every processor you run, plus priorities, timeouts and retry policies
+- ✅ **Short transactions** - work is claimed with leases, so no transaction or connection is held while handlers run; works with connection poolers and ORM transaction timeouts
+- ✅ **Horizontal scalability** - run any number of processors; claims use `FOR UPDATE SKIP LOCKED` and lease tokens fence out stale writers
+- ✅ **Near-realtime** - Postgres `LISTEN/NOTIFY` wakes processors immediately, with polling as a fallback
+- ✅ **Graceful shutdown** - in-flight handlers finish, and claimed-but-unstarted work is handed back
+- ✅ **Works with your ORM** - publish inside your existing transactions with Drizzle, Prisma, Kysely, postgres.js, Sequelize, Knex, TypeORM, ElectroDB, DynamoDB Toolbox or Dynamoose
+- ✅ **Pluggable storage** - PostgreSQL, MongoDB, Redis/Valkey, DynamoDB and in-memory stores included; implement `TxOBStore` for anything else
+- ✅ **OpenTelemetry-compatible** spans and metrics, without depending on an SDK
 
 ## Quick Start
 
-### Installation
-
-```sh
-# For PostgreSQL
-npm install txob pg
-
-# For MongoDB
-npm install txob mongodb
+```bash
+npm install txob pg   # or mongodb, ioredis / redis, @aws-sdk/client-dynamodb + @aws-sdk/lib-dynamodb
 ```
 
-### Basic Example (PostgreSQL)
-
-**1. Create the events table:**
-
-```sql
-CREATE TABLE events (
-  id UUID PRIMARY KEY,
-  timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-  type VARCHAR(255) NOT NULL,
-  data JSONB,
-  correlation_id UUID,
-  handler_results JSONB DEFAULT '{}',
-  errors INTEGER DEFAULT 0,
-  backoff_until TIMESTAMPTZ,
-  processed_at TIMESTAMPTZ
-);
-
--- Critical index for performance
-CREATE INDEX idx_events_processing ON events(processed_at, backoff_until, errors)
-WHERE processed_at IS NULL;
-```
-
-**2. Set up the event processor:**
+**1. Define your events:**
 
 ```typescript
-import { EventProcessor } from "txob";
-import { createProcessorClient } from "txob/pg";
+// events.ts
+import { z } from "zod";
+import { createOutbox } from "txob";
+import { createPgStore } from "txob/pg";
 import pg from "pg";
 
-const client = new pg.Client({
-  /* your config */
-});
-await client.connect();
+export const eventSchemas = {
+  UserCreated: z.object({ userId: z.string(), email: z.email() }),
+  OrderPlaced: z.object({ orderId: z.string(), accountId: z.string() }),
+};
 
-const processor = new EventProcessor({
-  client: createProcessorClient({ querier: client, eventSchemas }),
+export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+export const store = createPgStore({ pool });
+export const outbox = createOutbox({ eventSchemas, store });
+```
+
+**2. Create the tables** (Postgres 14+). Either run `migrate` at startup, or add the output of `getMigrationSql()` to your own migrations:
+
+```typescript
+import { migrate } from "txob/pg";
+await migrate(pool); // idempotent and safe to run from many processes at once
+```
+
+**3. Publish events in your business transactions:**
+
+```typescript
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  await client.query("INSERT INTO users (id, email) VALUES ($1, $2)", [
+    userId,
+    email,
+  ]);
+  await outbox.publish(
+    client,
+    "UserCreated",
+    { userId, email },
+    { correlation_id: requestId },
+  );
+  await client.query("COMMIT");
+} catch (error) {
+  await client.query("ROLLBACK");
+  throw error;
+} finally {
+  client.release();
+}
+```
+
+`publish` validates the data against the event's schema (throwing `TxOBValidationError` on failure) and inserts it using the connection you pass, so it commits or rolls back with your data.
+
+**4. Process them:**
+
+```typescript
+import { createEventProcessor } from "txob";
+import { createPgWakeupEmitter } from "txob/pg";
+import { eventSchemas, store } from "./events.js";
+
+const processor = createEventProcessor({
+  store,
+  eventSchemas,
+  wakeupEmitter: await createPgWakeupEmitter({
+    listenClientConfig: { connectionString: process.env.DATABASE_URL },
+  }),
   handlerMap: {
     UserCreated: {
-      // Handlers are processed concurrently and independently with retries
-      // If one handler fails, others continue processing
+      // A plain function: 5 attempts with exponential backoff
       sendWelcomeEmail: async (event, { signal }) => {
-        await emailService.send({
-          to: event.data.email,
-          subject: "Welcome!",
-          template: "welcome",
-        });
+        await emailService.send(
+          { to: event.data.email, template: "welcome" },
+          { signal },
+        );
       },
-      createStripeCustomer: async (event, { signal }) => {
-        await stripe.customers.create({
-          email: event.data.email,
-          metadata: { userId: event.data.userId },
-        });
+      // Or a config object with concurrency controls
+      createStripeCustomer: {
+        concurrency: 5,
+        rateLimit: { max: 25, durationMs: 1_000 },
+        retry: { maxAttempts: 10 },
+        timeoutMs: 15_000,
+        handler: async (event) => {
+          await stripe.customers.create(
+            {
+              email: event.data.email,
+              metadata: { userId: event.data.userId },
+            },
+            { idempotencyKey: `${event.id}:createStripeCustomer` },
+          );
+        },
+      },
+    },
+    OrderPlaced: {
+      updateAccountBalance: {
+        // One at a time per account; different accounts run in parallel
+        concurrency: {
+          perKey: { key: (event) => event.data.accountId, limit: 1 },
+        },
+        handler: async (event) => {
+          /* ... */
+        },
       },
     },
   },
@@ -162,1889 +188,508 @@ const processor = new EventProcessor({
 
 processor.start();
 
-// Graceful shutdown
-process.on("SIGTERM", () => processor.stop());
-```
-
-**3. Save events transactionally with your business logic:**
-
-```typescript
-import { randomUUID } from "crypto";
-
-// Inside your application code
-await client.query("BEGIN");
-
-// Save your business data
-await client.query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)", [
-  userId,
-  email,
-  name,
-]);
-
-// Save the event in the SAME transaction
-await client.query(
-  "INSERT INTO events (id, type, data, correlation_id, handler_results, errors) VALUES ($1, $2, $3, $4, $5, $6)",
-  [randomUUID(), "UserCreated", { userId, email }, correlationId, {}, 0],
-);
-
-await client.query("COMMIT");
-// ✅ Both user and event are saved atomically!
-// The processor will pick up the event and send the email
-```
-
-That's it! The processor will automatically poll for new events and execute your handlers.
-
-**Optional: Near-realtime delivery with wakeup signals**
-
-By default, the processor polls every `pollingIntervalMs` (5s). Add a wakeup emitter to trigger immediate processing the moment an event is inserted, dropping latency from seconds to milliseconds while keeping polling as a safety net.
-
-```typescript
-// PostgreSQL: Use Postgres NOTIFY
-import { createWakeupEmitter } from "txob/pg";
-
-const wakeupEmitter = await createWakeupEmitter({
-  listenClientConfig: clientConfig,
-  createTrigger: true,
-  querier: client,
-});
-
-// MongoDB: Use Change Streams (requires replica set or sharded cluster)
-import { createWakeupEmitter } from "txob/mongodb";
-
-const wakeupEmitter = await createWakeupEmitter({
-  mongo: mongoClient,
-  db: "myapp",
-});
-
-// Use with EventProcessor
-const processor = new EventProcessor({
-  client: processorClient,
-  wakeupEmitter, // Processor polls immediately on each wakeup signal
-  handlerMap: {
-    /* ... */
-  },
+process.on("SIGTERM", async () => {
+  await processor.stop(); // waits for in-flight handlers (default timeout 10s)
+  process.exit(0);
 });
 ```
 
-When a wakeup emitter is provided, the processor will:
-
-- Poll immediately when new events are inserted (via wakeup signal)
-- Throttle wakeup signals (`wakeupThrottleMs`) to coalesce bursts
-- Fall back to interval polling (`pollingIntervalMs`) if no wakeup signal is received within `wakeupTimeoutMs`
+The handler map must list every event type in `eventSchemas` (TypeScript enforces this). An empty object (`OrderPlaced: {}`) is valid and means "no side effects".
 
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Your Application                             │
-├─────────────────────────────────────────────────────────────────┤
-│  BEGIN TRANSACTION                                               │
-│    1. Insert/Update business data (users, orders, etc.)         │
-│    2. Insert event record                                        │
-│  COMMIT TRANSACTION                                              │
-└─────────────────────────────────────────────────────────────────┘
-                           │
-                           │ Both saved atomically ✅
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Events Table                                  │
-│  [id] [type] [data] [processed_at] [errors] [backoff_until]    │
-└─────────────────────────────────────────────────────────────────┘
-                           │
-        ┌──────────────────┴──────────────────┐
-        │                                      │
-        │ (Optional) Wakeup Signal            │
-        │ (Postgres NOTIFY / MongoDB Stream) │
-        │                                      │
-        ▼                                      ▼
-┌──────────────────────────────┐   ┌──────────────────────────────┐
-│      Polling Component       │   │   Fallback Polling Loop      │
-│  (Decoupled from Processing) │   │   (If wakeup signals missed)│
-├──────────────────────────────┤   ├──────────────────────────────┤
-│  • Listens for wakeup signals│   │  • Polls periodically        │
-│  • Throttles rapid signals   │   │  • Only if no recent wakeup  │
-│  • Triggers immediate poll    │   │  • Uses same throttled poll  │
-└──────────────────────────────┘   └──────────────────────────────┘
-        │                                      │
-        └──────────────────┬──────────────────┘
-                           │
-                           │ SELECT unprocessed events
-                           │ (FOR UPDATE SKIP LOCKED)
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Processing Queue                             │
-│  (Concurrency-controlled event queue)                           │
-└─────────────────────────────────────────────────────────────────┘
-                           │
-                           │ Process events concurrently
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Event Processor                                │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Lock event in transaction                                   │
-│  2. Execute handlers concurrently (send email, webhook, etc.)  │
-│  3. UPDATE event with results and processed_at                  │
-│  4. On failure: increment errors, set backoff_until             │
-└─────────────────────────────────────────────────────────────────┘
+publish(tx) ──► txob_events ──fan-out──► txob_deliveries ──claim──► handler
+               (in your tx)              one per (event, handler)   (with lease)
 ```
 
-**Key Points:**
+1. **Publish.** `outbox.publish(tx, ...)` inserts one row into `txob_events` inside your transaction. Publishing doesn't need to know which handlers exist.
+2. **Fan-out.** A processor leases unfanned events of the types it handles and, in a single statement, creates one **delivery** per registered handler and marks the events fanned out. Fan-out is idempotent: deliveries are keyed by `(event_id, handler)`.
+3. **Claim.** The processor claims pending deliveries up to its free capacity, highest priority first, within each handler's concurrency, per-key concurrency and rate limits. Limits count deliveries leased by **all** processors, and claims for a limited handler are serialized in the store, so they hold however many processors run. Claiming sets a lease (`leaseMs`, default 30s) and a fresh lease token, then commits. No transaction is held while handlers run.
+4. **Run.** Claimed deliveries run immediately. Leases of in-flight deliveries are renewed every `leaseMs / 3`.
+5. **Record.** Success marks the delivery `completed`. Failure schedules a retry with backoff, or marks it `dead` after `maxAttempts` (or immediately for `ErrorUnprocessableEventHandler`). Every write is conditional on the lease token, so a processor that lost its lease can't overwrite the work of the processor that took over.
 
-- Events are saved in the **same transaction** as your business data
-- If the transaction fails, neither the data nor event is saved
-- The processor runs independently and guarantees **at-least-once delivery**
-- Multiple processors can run concurrently using database row locking
-- Failed events are retried with exponential backoff
-- Polling and processing are **decoupled** - polling finds events, processing queue handles execution
-- **Wakeup signals** (Postgres NOTIFY or MongoDB Change Streams) reduce polling latency
-- **Throttled polling** prevents excessive database queries during event bursts
-- **Fallback polling** ensures events are processed even if wakeup signals are missed
+If a processor crashes, its leases expire and other processors pick the work up. A claim counts as an attempt, so a handler that crashes the process can't loop forever: once its attempts are used up, the delivery is marked dead without running again.
 
-For a detailed architecture diagram, see [architecture.mmd](./architecture.mmd).
+### Delivery guarantees
 
-## Core Concepts
+txob guarantees **at-least-once** delivery per handler. A handler can run more than once for the same event if the process crashes after the side effect but before the result is recorded, or if a lease is lost (for example, a long GC pause or network partition). **Make handlers idempotent**, e.g. by using `` `${event.id}:${handlerName}` `` as an idempotency key with external APIs.
 
-### Event Structure
+## Handler Configuration
 
-Every event in txob follows this structure:
-
-```typescript
-interface TxOBEvent<EventType extends string, EventData = Record<string, unknown>> {
-  id: string; // Unique event identifier (UUID recommended)
-  timestamp: Date; // When the event was created
-  type: EventType; // Event type (e.g., "UserCreated", "OrderPlaced")
-  data: EventData; // Event payload - can be strongly typed per event type
-  correlation_id: string; // For tracing requests across services
-  handler_results: Record<string, TxOBEventHandlerResult>; // Results from each handler
-  errors: number; // Number of processing attempts
-  backoff_until?: Date; // When to retry (null if not backing off)
-  processed_at?: Date; // When fully processed (null if pending)
-}
-```
-
-**Field Explanations:**
-
-- **`handler_results`**: Tracks each handler's status independently. If one handler fails, others can still succeed
-- **`errors`**: Global error count. When it reaches `maxErrors`, the event is marked as processed (failed)
-- **`backoff_until`**: Prevents immediate retries. Set to future timestamp after failures
-- **`correlation_id`**: Essential for distributed tracing and debugging
-
-### Event Handlers
-
-Handlers are async functions that execute your side-effects:
-
-```typescript
-type TxOBEventHandler<
-  EventType extends string = string,
-  EventData = Record<string, unknown>,
-> = (
-  event: TxOBEvent<EventType, EventData>,
-  opts: { signal?: AbortSignal },
-) => Promise<void>;
-```
-
-**Important:** Handlers should be **idempotent** because they may be called multiple times for the same event (at-least-once delivery).
-
-```typescript
-// ✅ Good: Idempotent handler
-const sendEmail: TxOBEventHandler = async (event) => {
-  const alreadySent = await checkIfEmailSent(event.data.userId);
-  if (alreadySent) return; // Safe to retry
-
-  await emailService.send(event.data.email);
-};
-
-// ❌ Bad: Not idempotent
-const incrementCounter: TxOBEventHandler = async (event) => {
-  await db.query("UPDATE counters SET count = count + 1"); // Will increment multiple times!
-};
-```
-
-#### Typed payloads with Standard Schema (Zod/ArkType/Valibot/etc.)
-
-txob uses schema-driven event payload typing through the Standard Schema interface.
-`eventSchemas` is required by both `createProcessorClient(...)` and `createEventProcessor(...)`.
-Use any validator that implements Standard Schema (for example Zod, ArkType, or Valibot).
-
-```typescript
-import { z } from "zod";
-import {
-  createEventHandlerMap,
-  createEventProcessor,
-  type TxOBEventSchemaMap,
-} from "txob";
-import { createProcessorClient } from "txob/pg";
-
-const eventSchemas = {
-  UserCreated: z.object({
-    userId: z.string().uuid(),
-    email: z.string().email(),
-  }),
-  OrderPlaced: z.object({
-    orderId: z.string().uuid(),
-    amount: z.number().positive(),
-  }),
-} satisfies TxOBEventSchemaMap<"UserCreated" | "OrderPlaced">;
-
-const handlerMap = createEventHandlerMap({
-  eventSchemas,
-  handlerMap: {
-    UserCreated: {
-      sendWelcomeEmail: async (event) => {
-        await emailService.send(event.data.email); // typed as string
-      },
-    },
-    OrderPlaced: {
-      sendReceipt: async (event) => {
-        await receipts.send(event.data.orderId, event.data.amount); // strongly typed
-      },
-    },
-  },
-});
-
-const processor = createEventProcessor({
-  eventSchemas,
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap,
-});
-```
-
-Schema-first inference via `eventSchemas` is the standard and required approach.
-
-### Handler Results
-
-Each handler's execution is tracked independently:
-
-```typescript
-type TxOBEventHandlerResult = {
-  processed_at?: Date; // When this handler succeeded
-  unprocessable_at?: Date; // When this handler was marked unprocessable
-  errors?: Array<{
-    // Error history for this handler
-    error: unknown;
-    timestamp: Date;
-  }>;
-};
-```
-
-This means if you have 3 handlers and 1 fails, the other 2 won't be re-executed on retry.
-
-### Delivery Guarantees
-
-**txob implements at-least-once delivery:**
-
-- ✅ Events are **never lost** even if the processor crashes
-- ⚠️ Handlers **may be called multiple times** for the same event
-- ⚠️ If `updateEvent` fails after handlers succeed, they will be re-invoked
-
-**Why this matters:**
-
-```typescript
-// This handler will be called again if the event update fails
-UserCreated: {
-  sendEmail: async (event) => {
-    await emailService.send(event.data.email); // ✅ Sent successfully
-    // 💥 But if updateEvent() fails here, this will run again!
-  };
-}
-```
-
-**Solution:** Make your handlers idempotent (check if work was already done before doing it again).
-
-### Error Handling
-
-txob provides sophisticated error handling:
-
-**1. Automatic Retries with Backoff**
-
-```typescript
-new EventProcessor({
-  client,
-  handlerMap: handlers,
-  maxErrors: 5, // Retry up to 5 times
-  backoff: ({ attempt, error, event, errors, maxErrors }) => {
-    // Custom backoff strategy
-    // error is the latest handler error, errors contains all handler errors for this attempt
-    // event is the event snapshot after this attempt's handlers finished
-    const delayMs = 1000 * 2 ** attempt; // Exponential: 1s, 2s, 4s, 8s, 16s
-    return new Date(Date.now() + delayMs);
-  },
-});
-```
-
-**2. Custom Backoff with TxOBError**
-
-You can throw `TxOBError` to specify a custom backoff time for retries:
-
-```typescript
-import { TxOBError } from "txob";
-
-UserCreated: {
-  sendEmail: async (event) => {
-    try {
-      await emailService.send(event.data.email);
-    } catch (err) {
-      if (err.code === "RATE_LIMIT_EXCEEDED") {
-        // Retry after 1 minute instead of using default backoff
-        throw new TxOBError("Rate limit exceeded", {
-          cause: err,
-          backoffUntil: new Date(Date.now() + 60000),
-        });
-      }
-      throw err; // Use default backoff for other errors
-    }
-  };
-}
-```
-
-**Note:** If multiple handlers throw `TxOBError` with different `backoffUntil` dates, the processor will use the latest (maximum) backoff time.
-
-**3. Unprocessable Events**
-
-Sometimes an event cannot be processed (e.g., invalid data). Mark it as unprocessable to stop retrying:
-
-```typescript
-import { ErrorUnprocessableEventHandler } from "txob";
-
-UserCreated: {
-  sendEmail: async (event) => {
-    if (!isValidEmail(event.data.email)) {
-      throw new ErrorUnprocessableEventHandler(
-        new Error("Invalid email address"),
-      );
-    }
-    await emailService.send(event.data.email);
-  };
-}
-```
-
-**4. Max Errors Hook**
-
-When an event reaches max errors, you can create a "dead letter" event:
-
-```typescript
-new EventProcessor({
-  client,
-  handlerMap: handlers,
-  onEventMaxErrorsReached: async ({ event, txClient, signal }) => {
-    // Save a failure event in the same transaction
-    await txClient.createEvent({
-      id: randomUUID(),
-      type: "EventFailed",
-      data: {
-        originalEventId: event.id,
-        originalEventType: event.type,
-        reason: "Max errors reached",
-      },
-      correlation_id: event.correlation_id,
-      handler_results: {},
-      errors: 0,
-    });
-
-    // Send alert, log to monitoring system, etc.
-  },
-});
-```
-
-## Database Setup
-
-### PostgreSQL
-
-**1. Create the events table:**
-
-```sql
-CREATE TABLE events (
-  id UUID PRIMARY KEY,
-  timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-  type VARCHAR(255) NOT NULL,
-  data JSONB,
-  correlation_id UUID,
-  handler_results JSONB DEFAULT '{}',
-  errors INTEGER DEFAULT 0,
-  backoff_until TIMESTAMPTZ,
-  processed_at TIMESTAMPTZ
-);
-```
-
-**2. Create indexes for optimal performance:**
-
-```sql
--- Critical: Partial index for unprocessed events (keeps index small and fast)
-CREATE INDEX idx_events_processing ON events(processed_at, backoff_until, errors)
-WHERE processed_at IS NULL;
-
--- Unique index on id (if not using id as PRIMARY KEY)
-CREATE UNIQUE INDEX idx_events_id ON events(id);
-
--- Optional: For querying by correlation_id
-CREATE INDEX idx_events_correlation_id ON events(correlation_id);
-```
-
-**Why these indexes?**
-
-The `idx_events_processing` partial index is critical for performance. It:
-
-- Only indexes unprocessed events (`WHERE processed_at IS NULL`)
-- Stays small as events are processed
-- Covers the main query pattern: `processed_at IS NULL AND (backoff_until IS NULL OR backoff_until < NOW()) AND errors < maxErrors`
-
-**3. Use the PostgreSQL client:**
-
-```typescript
-import { createProcessorClient } from "txob/pg";
-import pg from "pg";
-
-const client = new pg.Client({
-  user: process.env.POSTGRES_USER,
-  password: process.env.POSTGRES_PASSWORD,
-  database: process.env.POSTGRES_DB,
-});
-await client.connect();
-
-const processorClient = createProcessorClient({
-  querier: client,
-  table: "events", // Optional: table name (default: "events")
-  limit: 100, // Optional: max events per poll (default: 100)
-});
-```
-
-**4. (Optional) Set up wakeup signals to reduce polling:**
-
-```typescript
-import { createWakeupEmitter } from "txob/pg";
-
-// Create a wakeup emitter using Postgres NOTIFY
-// This will automatically create a trigger that sends NOTIFY on INSERT
-const wakeupEmitter = await createWakeupEmitter({
-  listenClientConfig: clientConfig,
-  createTrigger: true,
-  querier: client,
-  table: "events", // Optional: table name (default: "events")
-  channel: "txob_events", // Optional: NOTIFY channel (default: "txob_events")
-});
-
-// Use with EventProcessor
-const processor = new EventProcessor({
-  client: processorClient,
-  wakeupEmitter, // Reduces polling frequency when new events arrive
-  handlerMap: {
-    /* ... */
-  },
-  pollingIntervalMs: 5000, // Still used as fallback if wakeup signals are missed
-  wakeupTimeoutMs: 60000, // Fallback poll if no wakeup signal received in 60s
-  wakeupThrottleMs: 1000, // Throttle wakeup signals to prevent excessive polling
-});
-```
-
-### MongoDB
-
-**1. Create the events collection with indexes:**
-
-```typescript
-import { MongoClient } from "mongodb";
-
-const mongoClient = new MongoClient(process.env.MONGO_URL);
-await mongoClient.connect();
-const db = mongoClient.db("myapp");
-
-// Create collection
-const eventsCollection = db.collection("events");
-
-// Create indexes
-await eventsCollection.createIndex(
-  { processed_at: 1, backoff_until: 1, errors: 1 },
-  { partialFilterExpression: { processed_at: null } },
-);
-await eventsCollection.createIndex({ id: 1 }, { unique: true });
-await eventsCollection.createIndex({ correlation_id: 1 });
-```
-
-**2. Use the MongoDB client:**
-
-```typescript
-import { createProcessorClient } from "txob/mongodb";
-
-const processorClient = createProcessorClient({
-  mongo: mongoClient,
-  db: "myapp", // Database name
-  collection: "events", // Optional: collection name (default: "events")
-  limit: 100, // Optional: max events per poll (default: 100)
-});
-```
-
-**3. (Optional) Set up wakeup signals to reduce polling:**
-
-```typescript
-import { createWakeupEmitter } from "txob/mongodb";
-
-// Create a wakeup emitter using MongoDB Change Streams
-// Note: Requires a replica set or sharded cluster
-const wakeupEmitter = await createWakeupEmitter({
-  mongo: mongoClient,
-  db: "myapp",
-  collection: "events", // Optional: collection name (default: "events")
-});
-
-// Use with EventProcessor
-const processor = new EventProcessor({
-  client: processorClient,
-  wakeupEmitter, // Reduces polling frequency when new events arrive
-  handlerMap: {
-    /* ... */
-  },
-  pollingIntervalMs: 5000, // Still used as fallback if wakeup signals are missed
-  wakeupTimeoutMs: 60000, // Fallback poll if no wakeup signal received in 60s
-  wakeupThrottleMs: 100, // Throttle wakeup signals to prevent excessive polling
-});
-
-// Handle wakeup emitter errors (e.g., if not configured for replica set)
-wakeupEmitter.on("error", (err) => {
-  console.error("Wakeup emitter error:", err);
-  // Processor will automatically fall back to polling
-});
-```
-
-**Note:**
-
-- MongoDB transactions require a replica set or sharded cluster. [See MongoDB docs](https://www.mongodb.com/docs/manual/core/transactions/).
-- MongoDB Change Streams (used for wakeup signals) also require a replica set or sharded cluster. If your MongoDB instance is a standalone server, you must convert it to a single-node replica set by running `rs.initiate()` in the mongo shell.
-
-### Custom Database
-
-Implement the `TxOBProcessorClient` interface:
-
-```typescript
-interface TxOBProcessorClient<EventType extends string> {
-  getEventsToProcess(opts: {
-    signal?: AbortSignal;
-    maxErrors: number;
-  }): Promise<Pick<TxOBEvent<EventType>, "id" | "errors">[]>;
-
-  transaction(
-    fn: (txClient: TxOBTransactionProcessorClient<EventType>) => Promise<void>,
-  ): Promise<void>;
-}
-
-interface TxOBTransactionProcessorClient<EventType extends string> {
-  getEventByIdForUpdateSkipLocked(
-    eventId: string,
-    opts: { signal?: AbortSignal; maxErrors: number },
-  ): Promise<TxOBEvent<EventType> | null>;
-
-  updateEvent(event: TxOBEvent<EventType>): Promise<void>;
-
-  createEvent(
-    event: Omit<TxOBEvent<EventType>, "processed_at" | "backoff_until">,
-  ): Promise<void>;
-}
-```
-
-See [src/pg/client.ts](./src/pg/client.ts) or [src/mongodb/client.ts](./src/mongodb/client.ts) for reference implementations.
-
-## Configuration
-
-### Processor Options
-
-```typescript
-new EventProcessor({
-  client,
-  handlerMap,
-
-  // Polling interval in milliseconds, also used as fallback when wakeupEmitter is set (default: 5000)
-  pollingIntervalMs: 5000,
-
-  // Maximum errors before marking event as processed/failed (default: 5)
-  maxErrors: 5,
-
-  // Backoff calculation function (default: exponential backoff capped at 60s)
-  backoff: ({ attempt, error, event, errors, maxErrors }): Date => {
-    const baseDelayMs = 1000;
-    const maxDelayMs = 60000;
-    const backoffMs = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-    return new Date(Date.now() + backoffMs);
-  },
-
-  // Maximum concurrent events being processed (default: 20)
-  maxEventConcurrency: 20,
-
-  // Maximum concurrent handlers per event (default: 10)
-  maxHandlerConcurrency: 10,
-
-  // Maximum events buffered in the in-memory queue before polling pauses (default: 500)
-  maxQueuedEvents: 500,
-
-  // Optional wakeup emitter for near-realtime processing (default: undefined)
-  wakeupEmitter,
-
-  // Fallback poll fires if no wakeup signal received in this window (default: 60000)
-  wakeupTimeoutMs: 60000,
-
-  // Throttle wakeup signals to coalesce bursts (default: 1000)
-  wakeupThrottleMs: 1000,
-
-  // Custom logger (default: undefined)
-  logger: {
-    debug: (msg, ...args) => console.debug(msg, ...args),
-    info: (msg, ...args) => console.info(msg, ...args),
-    warn: (msg, ...args) => console.warn(msg, ...args),
-    error: (msg, ...args) => console.error(msg, ...args),
-  },
-
-  // OpenTelemetry-compatible tracing and metrics (default: undefined)
-  telemetry: {
-    tracer: trace.getTracer("txob"),
-    meter: metrics.getMeter("txob"),
-    attributes: {
-      "service.name": "orders-worker",
-      "deployment.environment": "production",
-    },
-  },
-
-  // Hook called when max errors reached (default: undefined)
-  onEventMaxErrorsReached: async ({ event, txClient, signal }) => {
-    // Create a dead-letter event, send alerts, etc.
-  },
-});
-```
-
-### Configuration Reference
-
-| Option                    | Type                      | Default     | Description                                                                         |
-| ------------------------- | ------------------------- | ----------- | ----------------------------------------------------------------------------------- |
-| `pollingIntervalMs`       | `number`                  | `5000`      | Milliseconds between polling cycles (used when no wakeup emitter or as fallback)    |
-| `maxErrors`               | `number`                  | `5`         | Max retry attempts before marking as failed                                         |
-| `backoff`                 | `(count: number) => Date` | Exponential | Calculate next retry time                                                           |
-| `maxEventConcurrency`     | `number`                  | `20`        | Max events processed simultaneously                                                 |
-| `maxHandlerConcurrency`   | `number`                  | `10`        | Max handlers per event running concurrently                                         |
-| `maxQueuedEvents`         | `number`                  | `500`       | Max events buffered in-memory before polling pauses                                 |
-| `wakeupEmitter`           | `WakeupEmitter`           | `undefined` | Optional wakeup signal emitter (Postgres NOTIFY or MongoDB Change Streams)          |
-| `wakeupTimeoutMs`         | `number`                  | `60000`     | Fallback poll if no wakeup signal received (only used with wakeupEmitter)           |
-| `wakeupThrottleMs`        | `number`                  | `1000`      | Throttle wakeup signals to prevent excessive polling (only used with wakeupEmitter) |
-| `logger`                  | `Logger`                  | `undefined` | Custom logger interface                                                             |
-| `telemetry`               | `TxOBTelemetry`           | `undefined` | OpenTelemetry-compatible tracer, meter, and shared attributes                       |
-| `onEventMaxErrorsReached` | `function`                | `undefined` | Hook for max errors                                                                 |
-
-## Usage Examples
-
-### Complete HTTP API Example
-
-This example shows a complete HTTP API that creates users and sends welcome emails transactionally:
-
-```typescript
-import http from "node:http";
-import { randomUUID } from "node:crypto";
-import pg from "pg";
-import gracefulShutdown from "http-graceful-shutdown";
-import { EventProcessor, ErrorUnprocessableEventHandler } from "txob";
-import { createProcessorClient } from "txob/pg";
-
-// 1. Define your event types
-const eventTypes = {
-  UserCreated: "UserCreated",
-  EventMaxErrorsReached: "EventMaxErrorsReached",
-} as const;
-
-type EventType = keyof typeof eventTypes;
-
-// 2. Set up database connection
-const client = new pg.Client({
-  user: process.env.POSTGRES_USER,
-  password: process.env.POSTGRES_PASSWORD,
-  database: process.env.POSTGRES_DB,
-});
-await client.connect();
-
-// 3. Create and start the processor
-const processor = new EventProcessor<EventType>({
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap: {
-    UserCreated: {
-      sendEmail: async (event, { signal }) => {
-        // Check if email was already sent (idempotency)
-        const sent = await checkEmailSent(event.data.userId);
-        if (sent) return;
-
-        // Send email
-        await emailService.send({
-          to: event.data.email,
-          subject: "Welcome!",
-          template: "welcome",
-        });
-
-        // Use signal for cleanup on shutdown
-        signal?.addEventListener("abort", () => {
-          emailService.cancelPending();
-        });
-      },
-
-      publishToEventBus: async (event) => {
-        await eventBus.publish("user.created", event.data);
-      },
-    },
-
-    EventMaxErrorsReached: {
-      alertOps: async (event) => {
-        await slack.send({
-          channel: "#alerts",
-          text: `Event failed: ${event.data.eventType} (${event.data.eventId})`,
-        });
-      },
-    },
-  },
-  pollingIntervalMs: 5000,
-  maxErrors: 5,
-  logger: console,
-  onEventMaxErrorsReached: async ({ event, txClient }) => {
-    await txClient.createEvent({
-      id: randomUUID(),
-      timestamp: new Date(),
-      type: eventTypes.EventMaxErrorsReached,
-      data: {
-        eventId: event.id,
-        eventType: event.type,
-      },
-      correlation_id: event.correlation_id,
-      handler_results: {},
-      errors: 0,
-    });
-  },
-});
-
-processor.start();
-
-// 4. Create HTTP server
-const server = http.createServer(async (req, res) => {
-  if (req.url !== "/users" || req.method !== "POST") {
-    res.statusCode = 404;
-    return res.end();
-  }
-
-  const correlationId = req.headers["x-correlation-id"] || randomUUID();
-
-  try {
-    const body = await getBody(req);
-    const { email, name } = JSON.parse(body);
-
-    // Start transaction
-    await client.query("BEGIN");
-
-    // Save user
-    const userId = randomUUID();
-    await client.query(
-      "INSERT INTO users (id, email, name) VALUES ($1, $2, $3)",
-      [userId, email, name],
-    );
-
-    // Save event IN THE SAME TRANSACTION
-    await client.query(
-      "INSERT INTO events (id, type, data, correlation_id, handler_results, errors) VALUES ($1, $2, $3, $4, $5, $6)",
-      [
-        randomUUID(),
-        eventTypes.UserCreated,
-        { userId, email, name },
-        correlationId,
-        {},
-        0,
-      ],
-    );
-
-    // Commit transaction
-    await client.query("COMMIT");
-
-    res.statusCode = 201;
-    res.end(JSON.stringify({ userId }));
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    res.statusCode = 500;
-    res.end(JSON.stringify({ error: "Internal server error" }));
-  }
-});
-
-const HTTP_PORT = process.env.PORT || 3000;
-server.listen(HTTP_PORT, () => console.log(`Server listening on ${HTTP_PORT}`));
-
-// 5. Graceful shutdown
-gracefulShutdown(server, {
-  onShutdown: async () => {
-    await processor.stop(); // Wait for in-flight events to complete
-    await client.end();
-  },
-});
-```
-
-### Multiple Event Types
-
-```typescript
-const processor = new EventProcessor({
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap: {
-    UserCreated: {
-      sendWelcomeEmail: async (event) => {
-        /* ... */
-      },
-      createStripeCustomer: async (event) => {
-        /* ... */
-      },
-    },
-
-    OrderPlaced: {
-      sendConfirmationEmail: async (event) => {
-        /* ... */
-      },
-      updateInventory: async (event) => {
-        /* ... */
-      },
-      notifyWarehouse: async (event) => {
-        /* ... */
-      },
-    },
-
-    PaymentFailed: {
-      sendRetryEmail: async (event) => {
-        /* ... */
-      },
-      logToAnalytics: async (event) => {
-        /* ... */
-      },
-    },
-  },
-});
-```
-
-### Custom Backoff Strategy
-
-```typescript
-// Linear backoff: 5s, 10s, 15s, 20s, 25s
-const linearBackoff = ({ attempt }): Date => {
-  const delayMs = 5000 * attempt;
-  return new Date(Date.now() + delayMs);
-};
-
-// Fixed delay: always 30s
-const fixedBackoff = (): Date => {
-  return new Date(Date.now() + 30000);
-};
-
-// Fibonacci backoff: 1s, 1s, 2s, 3s, 5s, 8s, 13s...
-const fibonacciBackoff = (() => {
-  const fib = (n: number): number => (n <= 1 ? 1 : fib(n - 1) + fib(n - 2));
-  return ({ attempt }): Date => {
-    const delayMs = fib(attempt) * 1000;
-    return new Date(Date.now() + delayMs);
-  };
-})();
-
-new EventProcessor({
-  client,
-  handlerMap: handlers,
-  backoff: linearBackoff, // or fixedBackoff, or fibonacciBackoff
-});
-```
-
-### Using AbortSignal for Cleanup
-
-```typescript
-UserCreated: {
-  sendEmail: async (event, { signal }) => {
-    // Long-running operation
-    const emailJob = emailService.sendLarge(event.data);
-
-    // Listen for shutdown signal
-    signal?.addEventListener("abort", () => {
-      console.log("Shutdown requested, canceling email...");
-      emailJob.cancel(); // Clean up quickly so event can be saved
-    });
-
-    await emailJob;
-  };
-}
-```
-
-### Using txob with Message Queues
-
-Use txob to guarantee consistency between your database and queue, then let the queue handle low-latency distribution:
-
-```typescript
-import { EventProcessor } from "txob";
-import { createProcessorClient } from "txob/pg";
-import { Kafka } from "kafkajs";
-
-const kafka = new Kafka({ brokers: ["localhost:9092"] });
-const producer = kafka.producer();
-await producer.connect();
-
-const processor = new EventProcessor({
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap: {
-    UserCreated: {
-      // Publish to Kafka with guaranteed consistency
-      publishToKafka: async (event) => {
-        // Kafka's idempotent producer handles deduplication
-        // Using event.id as the key ensures retries are safe
-        await producer.send({
-          topic: "user-events",
-          messages: [
-            {
-              key: event.id, // Use event.id for idempotency
-              value: JSON.stringify({
-                type: event.type,
-                data: event.data,
-                timestamp: event.timestamp,
-              }),
-            },
-          ],
-        });
-      },
-
-      // Also handle other side effects
-      sendEmail: async (event) => {
-        await emailService.send(event.data.email);
-      },
-    },
-  },
-});
-
-processor.start();
-```
-
-**Benefits of this approach:**
-
-- ✅ Database and Kafka are **guaranteed consistent** (via txob's transactional guarantees)
-- ✅ If Kafka publish fails, txob will retry automatically
-- ✅ Downstream consumers get low-latency events from Kafka
-- ✅ You can still handle other side effects (email, webhooks) in parallel
-- ✅ Best of both worlds: consistency from txob + speed from Kafka
-
-### Separate Processor Service
-
-You can run the processor as a separate service from your API:
-
-```typescript
-// processor-service.ts
-import { EventProcessor } from "txob";
-import { createProcessorClient } from "txob/pg";
-import pg from "pg";
-
-const client = new pg.Client({
-  /* config */
-});
-await client.connect();
-
-const processor = new EventProcessor({
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap: {
-    // All your handlers...
-  },
-});
-
-processor.start();
-console.log("Event processor started");
-
-// Graceful shutdown
-const shutdown = async () => {
-  console.log("Shutting down...");
-  await processor.stop();
-  await client.end();
-  process.exit(0);
-};
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-```
-
-Run multiple instances for horizontal scaling:
-
-```bash
-# Terminal 1
-node processor-service.js
-
-# Terminal 2
-node processor-service.js
-
-# Terminal 3
-node processor-service.js
-```
-
-All three will coordinate using database row locking (`FOR UPDATE SKIP LOCKED`).
-
-## API Reference
-
-### `new EventProcessor(opts)`
-
-Constructs a processor instance with `start()` and `stop()` methods.
-
-**Options (`opts`):**
-
-- `client`: `TxOBProcessorClient<EventType>` - Database client (required)
-- `handlerMap`: `TxOBEventHandlerMap<EventType>` - Map of event types to handlers (required)
-- `wakeupEmitter?`: `WakeupEmitter` - Optional wakeup emitter for near-realtime processing
-- `pollingIntervalMs?`, `wakeupTimeoutMs?`, `wakeupThrottleMs?`, `maxErrors?`, `backoff?`, `maxEventConcurrency?`, `maxHandlerConcurrency?`, `maxQueuedEvents?`, `logger?`, `telemetry?`, `onEventMaxErrorsReached?` - see [Configuration Reference](#configuration-reference)
-
-**Methods:**
+Each handler is either a function or a config object:
 
 ```typescript
 {
-  start: () => void;
-  stop: (opts?: { timeoutMs?: number }) => Promise<void>;
-}
-```
-
-**Example:**
-
-```typescript
-const processor = new EventProcessor({ client, handlerMap: handlers });
-processor.start();
-await processor.stop({ timeoutMs: 10000 }); // 10 second timeout
-```
-
-### `createProcessorClient` (PostgreSQL)
-
-Creates a PostgreSQL processor client.
-
-```typescript
-import { createProcessorClient } from "txob/pg";
-
-createProcessorClient(opts: {
-  querier: pg.Client;
-  eventSchemas: Record<string, StandardSchemaV1<unknown, unknown>>;
-  table?: string;    // Default: "events"
-  limit?: number;   // Default: 100
-}): TxOBProcessorClient<...inferred from eventSchemas...>
-```
-
-### `createProcessorClient` (MongoDB)
-
-Creates a MongoDB processor client.
-
-```typescript
-import { createProcessorClient } from "txob/mongodb";
-
-createProcessorClient(opts: {
-  mongo: mongodb.MongoClient;
-  db: string;               // Database name
-  eventSchemas: Record<string, StandardSchemaV1<unknown, unknown>>;
-  collection?: string;      // Default: "events"
-  limit?: number;           // Default: 100
-}): TxOBProcessorClient<...inferred from eventSchemas...>
-```
-
-### `TxOBError`
-
-Error class to specify custom backoff times for retries.
-
-```typescript
-import { TxOBError } from "txob";
-
-// Throw with custom backoff time
-throw new TxOBError("Rate limit exceeded", {
-  backoffUntil: new Date(Date.now() + 60000), // Retry after 1 minute
-});
-
-// Throw with cause and custom backoff
-throw new TxOBError("Processing failed", {
-  cause: originalError,
-  backoffUntil: new Date(Date.now() + 30000), // Retry after 30 seconds
-});
-```
-
-**Note:** If multiple handlers throw `TxOBError` with different `backoffUntil` dates, the processor will use the latest (maximum) backoff time.
-
-### `ErrorUnprocessableEventHandler`
-
-Error class to mark a handler as unprocessable (stops retrying).
-
-```typescript
-import { ErrorUnprocessableEventHandler } from "txob";
-
-throw new ErrorUnprocessableEventHandler(new Error("Invalid data"));
-```
-
-### `createWakeupEmitter` (PostgreSQL)
-
-Creates a Postgres NOTIFY-based wakeup emitter to reduce polling frequency.
-
-```typescript
-import { createWakeupEmitter } from "txob/pg";
-
-const wakeupEmitter = await createWakeupEmitter({
-  listenClientConfig: clientConfig,
-  createTrigger: true, // Automatically create database trigger
-  querier: client, // Required if createTrigger is true
-  table: "events", // Optional: table name (default: "events")
-  channel: "txob_events", // Optional: NOTIFY channel (default: "txob_events")
-});
-```
-
-The trigger automatically sends NOTIFY when new events are inserted. The wakeup emitter emits `wakeup` events that trigger immediate polling, reducing the need for constant polling.
-
-### `createWakeupEmitter` (MongoDB)
-
-Creates a MongoDB Change Stream-based wakeup emitter to reduce polling frequency.
-
-```typescript
-import { createWakeupEmitter } from "txob/mongodb";
-
-const wakeupEmitter = await createWakeupEmitter({
-  mongo: mongoClient,
-  db: "myapp",
-  collection: "events", // Optional: collection name (default: "events")
-});
-```
-
-**Important:** MongoDB Change Streams require a replica set or sharded cluster. If your MongoDB instance is a standalone server, you must convert it to a single-node replica set by running `rs.initiate()` in the mongo shell.
-
-If the database is not configured for Change Streams, an error will be emitted via the `error` event on the returned `WakeupEmitter`. The processor will automatically fall back to polling.
-
-### Types
-
-```typescript
-// Main event type
-type TxOBEvent<EventType extends string, EventData = Record<string, unknown>> = {
-  id: string;
-  timestamp: Date;
-  type: EventType;
-  data: EventData;
-  correlation_id: string;
-  handler_results: Record<string, TxOBEventHandlerResult>;
-  errors: number;
-  backoff_until?: Date | null;
-  processed_at?: Date;
-};
-
-// Handler function signature
-type TxOBEventHandler<
-  EventType extends string = string,
-  EventData = Record<string, unknown>,
-> = (
-  event: TxOBEvent<EventType, EventData>,
-  opts: { signal?: AbortSignal },
-) => Promise<void>;
-
-// Handler map structure
-type TxOBEventDataMap<EventType extends string> = Record<
-  EventType,
-  Record<string, unknown>
->;
-type TxOBEventHandlerMap<
-  EventType extends string,
-  EventDataMap extends TxOBEventDataMap<EventType>,
-> = {
-  [TType in EventType]: Record<string, TxOBEventHandler<TType, EventDataMap[TType]>>;
-};
-
-// Schema-first convenience API
-createEventProcessor({
-  eventSchemas,
-  client: createProcessorClient({ querier, eventSchemas }),
-  handlerMap,
-});
-
-// Handler result tracking
-type TxOBEventHandlerResult = {
-  processed_at?: Date;
-  unprocessable_at?: Date;
-  errors?: Array<{
-    error: unknown;
-    timestamp: Date;
-  }>;
-};
-
-// Logger interface
-interface Logger {
-  debug(message?: unknown, ...optionalParams: unknown[]): void;
-  info(message?: unknown, ...optionalParams: unknown[]): void;
-  warn(message?: unknown, ...optionalParams: unknown[]): void;
-  error(message?: unknown, ...optionalParams: unknown[]): void;
-}
-```
-
-## Best Practices
-
-### ✅ Do
-
-- **Keep handlers focused** - Each handler should perform a single, independent side effect (send email, call webhook, etc.)
-- **Make handlers idempotent** - Check if work was already done before doing it again
-- **Use correlation IDs** - Essential for tracing and debugging distributed systems
-- **Set appropriate maxErrors** - Balance between retry attempts and failure detection
-- **Monitor handler performance** - Track execution time and error rates
-- **Use AbortSignal** - Implement quick cleanup during graceful shutdown
-- **Create indexes** - The partial index on `processed_at` is critical for performance
-- **Validate event data** - Throw `ErrorUnprocessableEventHandler` for invalid data
-- **Use transactions** - Always save events with business data in the same transaction
-- **Test handlers** - Unit test handlers independently with mock events
-- **Log with context** - Include `event.id` and `correlation_id` in all logs
-
-### ❌ Don't
-
-- **Don't assume exactly-once** - Handlers may be called multiple times
-- **Don't require event ordering** - Handlers should be independent; if you need ordering, reconsider your design
-- **Don't perform long operations without signal checks** - Delays shutdown
-- **Don't ignore errors** - Handle them appropriately or let them propagate
-- **Don't skip the indexes** - Performance will degrade rapidly
-- **Don't save events outside transactions** - Defeats the purpose of the outbox pattern
-- **Don't use for hard real-time processing** - Without wakeup signals, polling introduces latency up to `pollingIntervalMs` (default 5s); with wakeup signals latency drops to tens of ms but is still bounded by handler execution and `wakeupThrottleMs`
-- **Don't modify events in handlers** - Event object is read-only
-- **Don't share mutable state** - Handlers may run concurrently
-- **Don't forget correlation IDs** - Makes debugging distributed issues very difficult
-
-### Performance Tips
-
-1. **Enable wakeup signals** - Pass a `wakeupEmitter` (Postgres NOTIFY or MongoDB Change Streams) to drop processing latency from seconds to milliseconds without increasing poll frequency
-2. **Tune concurrency limits** - Adjust `maxEventConcurrency` and `maxHandlerConcurrency` based on your workload
-3. **Reduce polling interval** - Lower `pollingIntervalMs` for lower latency without wakeup signals (at cost of more database queries)
-4. **Batch operations** - If handlers can batch work, collect multiple events
-5. **Monitor query performance** - Use `EXPLAIN ANALYZE` on the `getEventsToProcess` query
-6. **Partition the events table** - For very high volume, partition by `processed_at` or `timestamp`
-7. **Archive processed events** - Move old processed events to archive table to keep main table small
-
-## Troubleshooting
-
-### Events are not being processed
-
-**Check:**
-
-1. Is the processor started? `processor.start()` was called?
-2. Is the database connection working?
-3. Are events actually being saved? Query the events table
-4. Is `processed_at` NULL on pending events?
-5. Is `backoff_until` in the past (or NULL)?
-6. Is `errors` less than `maxErrors`?
-
-**Debug:**
-
-```typescript
-new EventProcessor({
-  client,
-  handlerMap: handlers,
-  logger: console, // Enable logging
-});
-```
-
-### High error rates
-
-**Check:**
-
-1. Are handlers throwing errors? Check logs
-2. Is an external service down? (email, API, etc.)
-3. Is event data invalid? Add validation
-4. Are handlers timing out? Increase timeouts
-
-**Solutions:**
-
-- Use `ErrorUnprocessableEventHandler` for invalid data
-- Implement circuit breakers for external services
-- Add retries within handlers for transient failures
-- Increase `maxErrors` if failures are expected
-
-### Events stuck in "processing" state
-
-This happens when:
-
-1. Processor crashed after locking event but before updating
-2. Transaction was rolled back
-
-**Solution:** Events are never truly "stuck" - they're locked at the transaction level. Once the transaction ends (commit or rollback), the lock is released and another processor can pick it up.
-
-If using `FOR UPDATE SKIP LOCKED` properly (which txob does), stuck events are not possible.
-
-### Performance is slow
-
-**Check:**
-
-1. Do you have the recommended indexes?
-2. How many unprocessed events are in the table?
-3. What's your `maxEventConcurrency` setting?
-4. Are handlers slow? Profile them
-
-**Solutions:**
-
-- Create the partial index on `processed_at`
-- Archive or delete old processed events
-- Increase `maxEventConcurrency`
-- Optimize slow handlers
-- Run multiple processor instances
-
-### Memory usage is high
-
-**Check:**
-
-1. How many events are processed concurrently?
-2. Are handlers leaking memory?
-3. Is the events table huge?
-
-**Solutions:**
-
-- Lower `maxEventConcurrency`
-- Profile handlers for memory leaks
-- Archive old events
-- Reduce `limit` in `createProcessorClient({ querier: client, eventSchemas, table, limit })`
-
-### Duplicate handler executions
-
-This is expected behavior due to **at-least-once delivery**. It happens when:
-
-- Event update fails after handler succeeds
-- Processor crashes after handler succeeds but before updating event
-
-**Solution:** Make handlers idempotent. Prefer pushing idempotency to the downstream system over check-then-act in the handler.
-
-**Why check-then-act is fragile:**
-
-```typescript
-// ❌ Race-prone: check + do + mark is not atomic across processes
-const handler = async (event) => {
-  const alreadyDone = await checkWorkStatus(event.id); // T1: false
-  if (alreadyDone) return;
-  // Another retry/processor can read `false` here too before T1 marks done
-  await doWork(event.data); // executed twice
-  await markWorkDone(event.id);
-};
-```
-
-This pattern only works if `checkWorkStatus` + `doWork` + `markWorkDone` runs under a strict distributed lock or the downstream system itself rejects duplicates. txob already serializes per-event execution via `FOR UPDATE SKIP LOCKED`, but if `doWork` mutates an external system the local "already done" record can be out of sync (handler succeeded, update failed, retry sees no record).
-
-**Better: rely on downstream idempotency.** Pass `event.id` (or a derived key) as an idempotency key the external system enforces:
-
-```typescript
-// ✅ Stripe rejects duplicate idempotency keys server-side
-const createStripeCharge = async (event) => {
-  await stripe.charges.create(
-    { amount: event.data.amount, customer: event.data.customerId },
-    { idempotencyKey: event.id },
-  );
-};
-
-// ✅ Upsert by event-derived id — DB enforces uniqueness
-const recordPayment = async (event) => {
-  await db.query(
-    `INSERT INTO payments (event_id, amount) VALUES ($1, $2)
-     ON CONFLICT (event_id) DO NOTHING`,
-    [event.id, event.data.amount],
-  );
-};
-
-// ✅ Kafka idempotent producer + event.id key dedupes within the producer session
-await producer.send({
-  topic: "user-events",
-  messages: [{ key: event.id, value: JSON.stringify(event.data) }],
-});
-```
-
-### Handlers that mutate external systems
-
-Avoid handler patterns that look like 2PC across the database and an external system — there is no way to make them atomic. Don't try to mirror external state into your database from inside the handler that triggered the mutation. The reliable pattern is:
-
-1. Handler issues the external mutation with an idempotency key (`event.id`) and returns.
-2. The external system signals completion via **webhook**.
-3. Your webhook endpoint applies the local mutation and, in the same transaction, raises any **domain-specific** txob events that downstream handlers care about.
-
-```typescript
-// ✅ Handler kicks off external work and returns — no waiting, no mirror writes
-UserSignedUp: {
-  startKycCheck: async (event) => {
-    await kyc.start({ userId: event.data.userId, idempotencyKey: event.id });
+  handler: async (event, { signal, attempt, handler }) => {},
+
+  // Enforced across all processors. A number is shorthand for { limit }.
+  concurrency: {
+    limit: 10, // max deliveries of this handler at once
+    perKey: { key: (event) => event.data.accountId, limit: 1 }, // max at once per key
   },
+
+  rateLimit: { max: 100, durationMs: 60_000 }, // max handler starts per sliding window
+
+  retry: {
+    maxAttempts: 5, // total attempts before the delivery is dead (default 5)
+    backoff: ({ attempt, error, event }) => 1000 * 2 ** attempt, // ms or Date (default: 1s doubling, max 60s)
+  },
+
+  timeoutMs: 30_000, // abort the handler's signal after this long
+
+  priority: (event) => (event.data.plan === "enterprise" ? 10 : 0), // or a number; higher first
 }
+```
 
-// ✅ Webhook endpoint applies the mutation and emits a domain event in the same transaction
-app.post("/webhooks/kyc", async (req, res) => {
-  await db.transaction(async (tx) => {
-    await tx.users.update(req.body.userId, { kycStatus: req.body.status });
+- **Concurrency, per-key concurrency and rate limits are global.** `concurrency: 5` means at most 5 deliveries of the handler run at once across all processors. Running deliveries are counted by their live leases, so a processor that crashes keeps holding its share until its leases expire (at most `leaseMs`).
+- **Claims for a limited handler are serialized** (a transaction-scoped advisory lock on Postgres, a short-lived lock document on MongoDB). Claims take milliseconds, but if one handler sees very high claim rates, prefer a higher `concurrency` on the processor over many tiny claims.
+- **`priority` and the `perKey` key are computed at fan-out** and stored with the delivery, so they're evaluated once per event, not per attempt.
+- **`timeoutMs` cancels the handler's context.** When it elapses, the `signal` passed to the handler is aborted with a `TxOBTimeoutError` reason. Honoring it is up to the handler: pass the signal to `fetch`, database drivers and so on, or check `signal.aborted`. Whatever the handler then does decides the outcome. If it throws, the attempt fails and is retried; if it finishes successfully anyway, the delivery is completed. The lease stays renewed while the handler runs.
+- **Process-wide defaults** go in `handlerDefaults: { retry, timeoutMs }`.
 
-    if (req.body.status === "approved") {
-      // Raise a domain event — not a "KycWebhookReceived" plumbing event
-      await tx.events.insert({
-        id: randomUUID(),
-        type: "UserKycApproved",
-        data: { userId: req.body.userId },
-        correlation_id: req.body.correlationId,
-        handler_results: {},
-        errors: 0,
-      });
-    }
-  });
-  res.sendStatus(200);
+### Tuning at runtime
+
+Limits aren't stored on queued deliveries. The processor passes its current settings with every claim, so raising a limit applies to work that is already queued, whether you redeploy with new values or change them live:
+
+```typescript
+// e.g. from a feature flag, shared config or an admin endpoint
+processor.configure({
+  concurrency: 50, // this processor's capacity
+  handlers: {
+    UserCreated: {
+      createStripeCustomer: {
+        concurrency: 20, // global, across all processors
+        rateLimit: { max: 100, durationMs: 1_000 }, // or null to remove the limit
+        retry: { maxAttempts: 10 },
+        timeoutMs: 30_000, // or null for no timeout
+      },
+    },
+  },
 });
+
+processor.getConfig(); // effective settings per handler, after overrides
 ```
 
-**Why:**
+- **Typed:** event types, handler names and values are checked against your handler map.
+- **Declarative and idempotent:** `handlers` replaces any previous overrides, and handlers it doesn't mention revert to their definitions. Applying the same config twice changes nothing. Invalid config throws and leaves the current settings untouched.
+- **When it takes effect:** from the next claim. Attempts already running keep the settings they started with.
+- **What can't be changed live:** `priority` and the `perKey` key function. They are computed when an event fans out, so changes apply to events fanned out afterwards; the per-key _limit_ is tunable via `perKeyConcurrency`.
+- **Scope:** `configure` changes this processor only. Global limits are checked with the claiming processor's settings, so apply the same config to every processor (shared config, a feature flag, or a broadcast to all instances) to keep them in agreement.
 
-- Handlers stay fast and bounded — no waiting on remote state machines
-- Retries are safe because the external system enforces idempotency
-- Local state converges from authoritative external signals, not optimistic local writes
-- txob events stay aligned with **domain concepts** (`UserKycApproved`), not transport plumbing (`KycWebhookReceived`) — downstream handlers depend on meaning, not delivery mechanism
+### Errors
 
-## Frequently Asked Questions
+| Thrown                                                 | Result                                                         |
+| ------------------------------------------------------ | -------------------------------------------------------------- |
+| any error                                              | retry after `retry.backoff`, dead after `retry.maxAttempts`    |
+| `new TxOBError(msg, { backoffUntil })`                 | retry no earlier than `backoffUntil` (e.g. from `Retry-After`) |
+| `new ErrorUnprocessableEventHandler(error)`            | dead immediately; retrying won't help                          |
+| `signal.reason` after `timeoutMs` (`TxOBTimeoutError`) | retry                                                          |
 
-### How is this different from a message queue?
+Events whose stored data no longer passes their schema are marked dead without running the handler.
 
-**The fundamental problem with message queues:**
+### Dead deliveries
 
-Message queues (RabbitMQ, SQS, Kafka) are **separate systems** from your database. You cannot make both operations atomic:
-
-```typescript
-// ❌ This is NOT atomic - the queue and database are separate systems
-await db.query("BEGIN");
-await db.createUser(user);
-await messageQueue.publish("user.created", user); // ✅ Succeeds
-await db.query("COMMIT"); // 💥 Fails! Message is queued but user doesn't exist
-```
-
-Even if you publish after commit, you have the opposite problem:
+`onDeliveryDead` runs **in the same transaction** that marks the delivery dead, so follow-up events it publishes commit atomically with that state change:
 
 ```typescript
-// ❌ Also NOT atomic
-await db.query("BEGIN");
-await db.createUser(user);
-await db.query("COMMIT"); // ✅ Succeeds
-await messageQueue.publish("user.created", user); // 💥 Fails! User exists but no message
-```
-
-**Message queues** require:
-
-- Additional infrastructure to run and monitor
-- Network calls to publish messages (can fail independently of database)
-- Handling connection failures
-- **No way to guarantee consistency** between database and queue
-- Complex error recovery (replay, reconciliation, etc.)
-
-**Transactional Outbox** with txob:
-
-- Uses your existing database (no additional infrastructure)
-- **Guaranteed consistency** - events saved in same transaction as data (atomicity via ACID)
-- No network calls during transaction (everything is in one database)
-- Simpler operational model
-- If transaction fails, neither data nor events are saved
-- If transaction succeeds, both data and events are saved
-
-**Trade-offs:**
-
-- Message queues: Lower latency (~10ms), higher per-broker throughput (10k+/s) with dedicated buffering and fan-out primitives
-- txob: Tens of ms with wakeup signals (or `pollingIntervalMs`-bounded without). Per-processor throughput is 10-100/s typical, but scales near-linearly with processor count until the database write ceiling — production deployments can reach 1k-10k+/s on a single Postgres/MongoDB. Ultimate ceiling is handler efficiency and DB write capacity, same as any consumer.
-
-**Can I use txob WITH message queues?**
-
-**Yes!** This is actually a great pattern. Use txob to guarantee consistency, then publish to your queue from a handler:
-
-```typescript
-UserCreated: {
-  publishToKafka: async (event) => {
-    // Now this is guaranteed to only run if user was created
-    await kafka.publish("user.created", event.data);
-    // If this fails, txob will retry it
-  };
-}
-```
-
-This gives you:
-
-- ✅ Guaranteed consistency between database and queue (via txob)
-- ✅ Low latency downstream (via message queue)
-- ✅ Idempotent publishing (txob handles retries)
-
-### Can I use this without microservices?
-
-**Yes!** The transactional outbox pattern is useful in any application that needs reliable side-effects:
-
-- Monoliths that send emails
-- Single-service apps that call webhooks
-- Any app that needs guaranteed event delivery
-
-You don't need a microservices architecture to benefit from txob.
-
-### What happens if the processor crashes?
-
-The processor is designed to handle crashes gracefully:
-
-1. **During handler execution:** The transaction hasn't committed yet, so the event remains unprocessed. Another processor (or restart) will pick it up.
-2. **After handler but before update:** Same as above - event remains unprocessed.
-3. **During event update:** Database transaction ensures atomicity. Either the update completes or it doesn't.
-
-**Result:** Events are never lost. At worst, handlers are called again (which is why idempotency matters).
-
-### How do I handle duplicate handler executions?
-
-Make your handlers **idempotent** by checking if work was already done:
-
-```typescript
-// Pattern 1: Check external system
-const sendEmail = async (event) => {
-  const sent = await emailService.checkSent(event.id);
-  if (sent) return; // Already sent
-
-  await emailService.send(event.data.email);
-};
-
-// Pattern 2: Use unique constraints
-const createStripeCustomer = async (event) => {
-  try {
-    await stripe.customers.create({
-      id: event.data.userId, // Stripe will reject if already exists
-      email: event.data.email,
+createEventProcessor({
+  // ...
+  onDeliveryDead: async ({ event, handler, attempts, error, publish }) => {
+    await publish("DeliveryDead", {
+      eventId: event.id,
+      handler,
+      error: String(error),
     });
-  } catch (err) {
-    if (err.code === "resource_already_exists") return; // Already created
-    throw err;
-  }
-};
-
-// Pattern 3: Track in database
-const processPayment = async (event) => {
-  const processed = await db.query(
-    "SELECT 1 FROM payment_events WHERE event_id = $1",
-    [event.id],
-  );
-  if (processed.rowCount > 0) return;
-
-  await processPayment(event.data);
-  await db.query("INSERT INTO payment_events (event_id) VALUES ($1)", [
-    event.id,
-  ]);
-};
-```
-
-### Can I process events in a specific order?
-
-**Short answer: You generally shouldn't need to.**
-
-Events are processed concurrently by default, and **handlers should contain single, independent side effects**. If you need ordering, it usually indicates a design issue.
-
-**Why ordering is usually a design smell:**
-
-- Each handler should represent one side effect (send email, call webhook, etc.)
-- Side effects are typically independent and don't need ordering
-- Ordering defeats the purpose of concurrent processing and reduces throughput
-- If side effects must happen in sequence, they might belong in the same handler
-
-**Better approaches:**
-
-1. **Make side effects independent** (recommended):
-
-```typescript
-UserCreated: {
-  sendEmail: async (event) => { /* sends welcome email */ },
-  createStripeCustomer: async (event) => { /* creates customer */ },
-  // These can run in any order or concurrently ✅
-}
-```
-
-2. **If truly dependent, combine into one handler**:
-
-```typescript
-UserCreated: {
-  completeOnboarding: async (event) => {
-    // These MUST happen in order
-    await createStripeCustomer(event.data);
-    await sendWelcomeEmail(event.data);
-    await enrollInTrial(event.data);
-  };
-}
-```
-
-3. **Use separate event types** for workflows:
-
-```typescript
-// Event 1 creates the customer
-UserCreated: {
-  createStripeCustomer: async (event) => {
-    await stripe.customers.create(event.data);
-    // Create next event when done
-    await createEvent({ type: "StripeCustomerCreated", ... });
-  }
-}
-
-// Event 2 sends the email
-StripeCustomerCreated: {
-  sendWelcomeEmail: async (event) => {
-    await emailService.send(event.data);
-  }
-}
-```
-
-**If you absolutely must process events sequentially** (not recommended):
-
-```typescript
-new EventProcessor({
-  client,
-  handlerMap: handlers,
-  maxEventConcurrency: 1, // Forces sequential processing
-  // ⚠️ This sacrifices throughput and concurrency benefits
+  },
 });
 ```
 
-### How do I monitor event processing?
+If the hook throws, the transaction rolls back and the delivery is retried after its lease expires.
 
-**1. Enable OpenTelemetry-compatible telemetry:**
+Like any transaction callback, the hook can run more than once: when the hook throws, when a MongoDB transaction hits a transient error, or when a Redis `WATCH` sees a concurrent change. Only one run commits, so keep side effects inside `tx` and `publish`.
 
-txob can emit spans and metrics without depending on a specific telemetry SDK. Install and configure OpenTelemetry in your application, then pass a `Tracer` and/or `Meter` to opt in:
+## Processor Options
+
+| Option              | Default  | Description                                                            |
+| ------------------- | -------- | ---------------------------------------------------------------------- |
+| `store`             | required | Storage backend, e.g. `createPgStore({ pool })`                        |
+| `eventSchemas`      | required | Standard Schema per event type                                         |
+| `handlerMap`        | required | Handlers per event type                                                |
+| `handlerDefaults`   | `{}`     | Default `retry` and `timeoutMs` for all handlers                       |
+| `concurrency`       | `20`     | Max deliveries running in this processor at once                       |
+| `leaseMs`           | `30000`  | Lease duration; renewed every `leaseMs / 3` while work is in progress  |
+| `fanoutBatchSize`   | `100`    | Max events fanned out per poll                                         |
+| `pollingIntervalMs` | `5000`   | Poll interval; wakeup signals and completions trigger polls in between |
+| `wakeupEmitter`     | none     | Source of `wakeup` events, e.g. `createPgWakeupEmitter`                |
+| `wakeupThrottleMs`  | `100`    | Minimum time between wakeup-triggered polls                            |
+| `onDeliveryDead`    | none     | Hook run in the transaction that marks a delivery dead                 |
+| `logger`            | none     | `{ debug, info, warn, error }` (pino, console, ...)                    |
+| `telemetry`         | none     | `{ tracer, meter, attributes }`, OpenTelemetry-compatible              |
+
+## PostgreSQL
+
+```typescript
+import {
+  createPgStore,
+  migrate,
+  getMigrationSql,
+  createPgWakeupEmitter,
+} from "txob/pg";
+
+const store = createPgStore({
+  pool, // pg.Pool, or any pg-compatible pool (e.g. @neondatabase/serverless)
+  schema: "app", // optional: Postgres schema (default: search_path)
+  tablePrefix: "txob_", // optional
+});
+
+await migrate(pool, { schema: "app", tablePrefix: "txob_", channel: "txob" });
+```
+
+`migrate` creates the `txob_events` and `txob_deliveries` tables, a small `txob_rate_limit_claims` log for rate-limited handlers, their indexes, and statement-level `AFTER INSERT` triggers that `pg_notify` the wakeup channel. To create them with your ORM's migrations instead, see [ORMs and drivers](#orms-and-drivers).
+
+### ORMs and drivers
+
+Pass an `adapter` instead of a `pool`, and txob runs through your ORM. You then publish with your ORM's own transaction handle, and `onDeliveryDead` receives the same type:
+
+| Library                                             | Adapter                                                | Publish with                                       | Tables                          |
+| --------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------- | ------------------------------- |
+| [Drizzle](https://orm.drizzle.team)                 | `drizzleAdapter(db)` from `txob/pg/drizzle`            | `tx` from `db.transaction`                         | `txobTables()` for Drizzle Kit  |
+| [Kysely](https://kysely.dev)                        | `kyselyAdapter(db)` from `txob/pg/kysely`              | `trx` from `db.transaction().execute`              | `txobMigration()`               |
+| [Prisma](https://www.prisma.io)                     | `prismaAdapter(prisma)` from `txob/pg/prisma`          | `tx` from `prisma.$transaction(async (tx) => ...)` | migration SQL in its own schema |
+| [postgres.js](https://github.com/porsager/postgres) | `postgresAdapter(sql)` from `txob/pg/postgres`         | `sql` from `sql.begin`                             | `migrate`                       |
+| [Sequelize](https://sequelize.org)                  | `sequelizeAdapter(sequelize)` from `txob/pg/sequelize` | `t` from `sequelize.transaction(async (t) => ...)` | `txobMigration()`               |
+| [Knex](https://knexjs.org)                          | `knexAdapter(knex)` from `txob/pg/knex`                | `trx` from `knex.transaction`                      | `txobMigration()`               |
+| [TypeORM](https://typeorm.io)                       | `typeormAdapter(dataSource)` from `txob/pg/typeorm`    | `manager` from `dataSource.transaction`            | `txobMigration()`               |
+
+```typescript
+import { drizzle } from "drizzle-orm/node-postgres";
+import { createPgStore } from "txob/pg";
+import { drizzleAdapter } from "txob/pg/drizzle";
+
+const db = drizzle(pool);
+const store = createPgStore({ adapter: drizzleAdapter(db) });
+const outbox = createOutbox({ eventSchemas, store });
+
+await db.transaction(async (tx) => {
+  const [user] = await tx.insert(users).values(input).returning();
+  await outbox.publish(tx, "UserCreated", {
+    userId: user.id,
+    email: user.email,
+  });
+});
+```
+
+Every adapter passes the same store test suite as the plain `pg` store, including the cross-processor limit tests. Anything else that can run a parameterized query and open a transaction can implement the three-method `PgAdapter` interface.
+
+**Creating the tables** with your ORM's migration tooling, so txob's tables live in the same migration history as yours:
+
+- **Drizzle:** export the tables from your schema file, and Drizzle Kit generates them with your other tables. Drizzle Kit can't create triggers, so if you use a wakeup emitter, add `getWakeupTriggerStatements()` with `drizzle-kit generate --custom`.
+  ```typescript
+  // schema.ts
+  export const { txobEvents, txobDeliveries, txobRateLimitClaims } =
+    txobTables();
+  ```
+- **Prisma:** Prisma Migrate drops tables that `schema.prisma` doesn't model, and it can't model txob's partial indexes. Keep txob in a Postgres schema of its own, which Prisma leaves alone, and add the DDL as a migration:
+  ```bash
+  mkdir -p prisma/migrations/20260101000000_txob
+  node -e 'console.log(require("txob/pg").getMigrationSql({ schema: "txob" }))' \
+    > prisma/migrations/20260101000000_txob/migration.sql
+  ```
+  Then use `createPgStore({ adapter: prismaAdapter(prisma), schema: "txob" })`. `prismaAdapter(prisma, { transactionOptions: { timeout } })` raises Prisma's 5s interactive transaction timeout if `onDeliveryDead` does slow work.
+- **Kysely, Knex, Sequelize, TypeORM:** `txobMigration(opts)` returns a migration in each tool's format, e.g. `export const { up, down } = txobMigration()` for Kysely and Knex, `module.exports = txobMigration()` for sequelize-cli, or `migrations: [txobMigration()]` in a TypeORM `DataSource`.
+- **Anything else:** `migrate(poolOrAdapter, opts)` at startup, or `getMigrationSql(opts)` in a migration.
+
+`txob/pg` doesn't need the `pg` package unless you use `createPgStore({ pool })` or `createPgWakeupEmitter`. With postgres.js, `createPostgresWakeupEmitter(sql)` from `txob/pg/postgres` uses postgres.js's own `LISTEN`.
+
+`createPgWakeupEmitter` uses a dedicated connection for `LISTEN`; pass the same `channel` you migrated with. If the connection drops, processors keep polling; attach an `error` listener to be told about it.
+
+**Connections:** completions and lease renewals are single short statements on the pool. Claims for handlers with limits run in a short transaction that takes a transaction-scoped advisory lock per limited handler, and marking a delivery dead runs in a transaction when `onDeliveryDead` is set. This works with PgBouncer in transaction mode, except for the `LISTEN` connection, which needs a direct (session-mode) connection.
+
+**Retention:** completed and dead deliveries stay in the tables. Prune them on a schedule; deleting an event cascades to its deliveries:
+
+```sql
+DELETE FROM txob_events e
+WHERE e.fanned_out_at < now() - interval '7 days'
+  AND NOT EXISTS (SELECT 1 FROM txob_deliveries d WHERE d.event_id = e.id AND d.status = 'pending');
+```
+
+**Inspecting state:**
+
+```sql
+-- Backlog and failures per handler
+SELECT event_type, handler, status, count(*), max(attempts)
+FROM txob_deliveries GROUP BY 1, 2, 3;
+
+-- Why did a delivery die?
+SELECT event_id, handler, attempts, last_error FROM txob_deliveries WHERE status = 'dead';
+
+-- Retry a dead delivery
+UPDATE txob_deliveries SET status = 'pending', attempts = 0, run_after = now()
+WHERE event_id = $1 AND handler = $2;
+```
+
+## MongoDB
+
+```typescript
+import { MongoClient } from "mongodb";
+import { createOutbox } from "txob";
+import {
+  createMongoStore,
+  migrate,
+  createMongoWakeupEmitter,
+} from "txob/mongodb";
+
+const client = await new MongoClient(process.env.MONGO_URL).connect();
+const opts = { client, db: "app", collectionPrefix: "txob_" };
+
+await migrate(opts); // creates indexes; idempotent
+const store = createMongoStore(opts);
+const outbox = createOutbox({ eventSchemas, store });
+
+// Publish inside your transaction by passing the session
+const session = client.startSession();
+try {
+  await session.withTransaction(async () => {
+    await client.db("app").collection("users").insertOne(user, { session });
+    await outbox.publish(session, "UserCreated", {
+      userId: user.id,
+      email: user.email,
+    });
+  });
+} finally {
+  await session.endSession();
+}
+
+const processor = createEventProcessor({
+  store,
+  eventSchemas,
+  handlerMap,
+  wakeupEmitter: await createMongoWakeupEmitter(opts), // change stream on inserts
+});
+```
+
+- **Requires a replica set or sharded cluster.** Atomic publishing and `onDeliveryDead` use multi-document transactions, and wakeups use change streams. A standalone server can run as a single-node replica set.
+- **Timestamps come from the processors' clocks.** Keep them synchronized (e.g. NTP); skew well below `leaseMs` is harmless.
+- **Retention:** deleting an event does not cascade. Delete its deliveries (`{ event_id }`) along with it.
+
+## Redis and Valkey
+
+```typescript
+import { Redis } from "ioredis"; // or a connected node-redis client, or iovalkey
+import { createOutbox } from "txob";
+import { createRedisStore, createRedisWakeupEmitter } from "txob/redis";
+
+const redis = new Redis(process.env.REDIS_URL);
+const store = createRedisStore({ client: redis }); // optional: prefix (default "{txob}:")
+const outbox = createOutbox({ eventSchemas, store });
+
+// Publish on the same MULTI as your writes; the event commits with them
+const multi = redis.multi();
+multi.hset(`user:${user.id}`, user);
+await outbox.publish(multi, "UserCreated", {
+  userId: user.id,
+  email: user.email,
+});
+await multi.exec();
+
+const processor = createEventProcessor({
+  store,
+  eventSchemas,
+  handlerMap,
+  wakeupEmitter: await createRedisWakeupEmitter({ client: redis }), // pub/sub
+});
+```
+
+- **Clients:** ioredis, iovalkey and node-redis are detected automatically (tested with ioredis 6, iovalkey 0.4 and node-redis 6); txob has no runtime dependency on any of them. `TTx` is your client's own `MULTI` type, so `publish` only accepts a `MULTI` from that client.
+- **Servers:** tested against Redis 8 and Valkey 8. Every claim and state change is one Lua script, so the limits hold across processors without locks. The scripts build key names at runtime, which some Redis-compatible servers (e.g. Dragonfly) only allow with extra configuration. Those servers are untested.
+- **Read-modify-write:** `WATCH` the keys you read before `MULTI`, as usual. The event is only written if `EXEC` succeeds.
+- **`MULTI` doesn't roll back.** If one of your queued commands fails at runtime (e.g. `WRONGTYPE`), the rest, including the event, still apply. Publishing with an `id` that already exists is a no-op instead of an error.
+- **Durability** is whatever your persistence settings give you. For an outbox, use AOF (`appendfsync always` for no loss, `everysec` to risk up to a second) and `maxmemory-policy noeviction` so txob's keys are never evicted.
+- **Cluster:** all of txob's keys share the `{txob}` hash tag, so they live in one slot. To publish in the same `MULTI` as your writes, your keys must use the same hash tag. Cluster mode isn't covered by the test suite yet.
+- **ORMs:** Redis OM's `repository.save` can't join a `MULTI`, so writes made through it can't be published atomically. Write those keys with the client on the same `MULTI` instead.
+- **Retention:** completed deliveries keep their hash. Prune `{txob}:d:*`, `{txob}:e:*` and their entries in the `{txob}:deliveries` / `{txob}:events` sorted sets on a schedule.
+
+## DynamoDB
+
+```typescript
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  TransactWriteCommand,
+} from "@aws-sdk/lib-dynamodb";
+import { createOutbox } from "txob";
+import {
+  createDynamoStore,
+  migrate,
+  type DynamoTransactItems,
+} from "txob/dynamodb";
+
+const client = new DynamoDBClient({});
+const documentClient = DynamoDBDocumentClient.from(client);
+await migrate({ client, tableName: "txob" }); // or getTableDefinition() for CDK/Terraform
+const store = createDynamoStore({ client, tableName: "txob" });
+const outbox = createOutbox({ eventSchemas, store });
+
+// The transaction is the list of TransactWriteItems; add yours, publish, send them together
+const tx: DynamoTransactItems = [
+  {
+    Put: {
+      TableName: "users",
+      Item: user,
+      ConditionExpression: "attribute_not_exists(pk)",
+    },
+  },
+];
+await outbox.publish(tx, "UserCreated", { userId: user.id, email: user.email });
+await documentClient.send(new TransactWriteCommand({ TransactItems: tx }));
+
+const processor = createEventProcessor({
+  store,
+  eventSchemas,
+  handlerMap,
+  pollingIntervalMs: 1_000, // no wakeup emitter: DynamoDB Streams can't push to a process
+});
+```
+
+ORMs build the same kind of items, so their writes and your event go out in one request:
+
+```typescript
+// ElectroDB: build the service transaction's params instead of calling .go()
+const { TransactItems = [] } = app.transaction
+  .write(({ users }) => [users.create(user).commit()])
+  .params();
+const tx = [...TransactItems] as DynamoTransactItems;
+await outbox.publish(tx, "UserCreated", { userId: user.id, email: user.email });
+await documentClient.send(new TransactWriteCommand({ TransactItems: tx }));
+
+// DynamoDB Toolbox: collect each transaction's .params()
+const tx: DynamoTransactItems = [
+  UserEntity.build(PutTransaction).item(user).params(),
+];
+await outbox.publish(tx, "UserCreated", { userId: user.id, email: user.email });
+await documentClient.send(new TransactWriteCommand({ TransactItems: tx }));
+
+// Dynamoose: get the request instead of sending it; it uses low-level AttributeValues,
+// so convert txob's items with marshallTransactItems
+import { marshallTransactItems } from "txob/dynamodb";
+const request = await dynamoose.transaction([User.transaction.create(user)], {
+  return: "request",
+});
+const tx: DynamoTransactItems = [];
+await outbox.publish(tx, "UserCreated", { userId: user.id, email: user.email });
+await client.send(
+  new TransactWriteItemsCommand({
+    TransactItems: [...request.TransactItems, ...marshallTransactItems(tx)],
+  }),
+);
+```
+
+- **Table:** one table with a string partition key `pk` and two sparse global secondary indexes (see `getTableDefinition`). Pending deliveries are indexed per handler and priority, sorted by when they're due, so claims never read leased deliveries or ones waiting on a backoff. Index reads are eventually consistent, but every claim is a conditional write, so a stale read can't double-claim.
+- **Limits:** each handler with a concurrency, per-key or rate limit has a small limiter item listing its running deliveries. Claims update it in the same transaction as the deliveries, guarded by a version number, so limits hold across processors; completions and lease renewals update it in the same transaction as the delivery. DynamoDB caps a single item at 1,000 write units per second, and transactional writes cost two, so one limiter item handles about 500 claims, completions and renewal batches per second. Its 400 KB size limit caps it at a few thousand running deliveries or rate-limit entries per handler.
+- **Per-key limits:** keys at their limit are filtered out of claim queries. If one key's backlog is larger than a claim reads (a few thousand deliveries), each claim continues where the last one stopped, so other keys at the same priority may wait a few polls but are never starved.
+- **Transactions** hold at most 100 items, and the event takes one of them. `onDeliveryDead` writes join the transaction that marks the delivery dead, so they share that limit.
+- **Priorities** must be 32-bit integers. Timestamps come from the processors' clocks, so keep them synchronized.
+- **Retention:** add a TTL attribute in your own retention job, or delete completed `d#` and `e#` items on a schedule.
+
+## Testing
+
+`txob/memory` provides an in-process store with the same semantics, so you can run your real handler map in unit tests without a database:
+
+```typescript
+import { createMemoryStore } from "txob/memory";
+
+const store = createMemoryStore();
+const outbox = createOutbox({ eventSchemas, store });
+const processor = createEventProcessor({
+  store,
+  eventSchemas,
+  handlerMap,
+  pollingIntervalMs: 10,
+});
+processor.start();
+
+await store.transaction((tx) =>
+  outbox.publish(tx, "UserCreated", { userId: "u1", email: "a@b.co" }),
+);
+// ...wait, then assert on side effects or store.getDeliveries()
+await processor.stop();
+```
+
+## Custom Stores
+
+A store implements `TxOBStore<TTx>`, where `TTx` is whatever handle your writes run on (a connection, an ORM transaction, a Redis `MULTI`, a DynamoDB `TransactWriteItems` batch, ...). The built-in stores show how different backends meet the contract: SQL with row locks (`txob/pg`), documents with compare-and-set (`txob/mongodb`), Lua scripts (`txob/redis`) and conditional transactions (`txob/dynamodb`). A store needs three primitives:
+
+1. **An atomic write with business data**, for `insertEvent`. Without this you don't have an outbox.
+2. **Compare-and-set**, for lease-fenced `completeDelivery`, `failDelivery`, `extendLeases` and `releaseDeliveries`.
+3. **An ordered query on due time**, for `claimEventsForFanout` and `claimDeliveries`.
+
+The behavioral contract every store must satisfy lives in this repo at [`test/contract.ts`](./test/contract.ts) (it is not part of the npm package); copy it and run `runStoreContract(name, setup)` against your store. [`src/memory/store.ts`](./src/memory/store.ts) is a compact reference implementation.
+
+## Telemetry
+
+Pass an OpenTelemetry `Tracer` and/or `Meter` to opt in:
 
 ```typescript
 import { metrics, trace } from "@opentelemetry/api";
 
-const processor = new EventProcessor({
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap: handlers,
+createEventProcessor({
+  // ...
   telemetry: {
     tracer: trace.getTracer("txob"),
     meter: metrics.getMeter("txob"),
-    attributes: {
-      "service.name": "orders-worker",
-      "deployment.environment": process.env.NODE_ENV ?? "development",
-    },
+    attributes: { "service.name": "billing" },
   },
 });
 ```
 
-This records `txob.poll`, `txob.event.process`, and `txob.handler.process` spans plus `txob.poll.count`, `txob.poll.duration`, `txob.event.processing.count`, `txob.event.processing.duration`, `txob.handler.processing.count`, and `txob.handler.processing.duration` metrics. Metrics use low-cardinality attributes such as event type, handler name, and outcome; event IDs and correlation IDs are only attached to spans.
+| Name                                           | Kind                | Attributes                                                                                                             |
+| ---------------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `txob.poll`                                    | span                | `txob.deliveries.active`, `txob.events.fanned_out`, `txob.deliveries.claimed`                                          |
+| `txob.delivery.process`                        | span                | event id/type/correlation id, `txob.handler.name`, `txob.delivery.attempt`, `txob.delivery.outcome`                    |
+| `txob.poll.count` / `.duration`                | counter / histogram | `txob.poll.outcome` (`success`, `error`)                                                                               |
+| `txob.fanout.count`                            | counter             | events fanned out                                                                                                      |
+| `txob.delivery.processing.count` / `.duration` | counter / histogram | `txob.event.type`, `txob.handler.name`, `txob.delivery.outcome` (`success`, `retry`, `dead`, `lease_lost`, `released`) |
 
-The full set of telemetry names is exported as constants from `txob`: `TxOBTelemetrySpanName`, `TxOBTelemetryMetricName`, `TxOBTelemetryAttributeKey`, `TxOBTelemetryEventOutcome`, `TxOBTelemetryHandlerOutcome`, and `TxOBTelemetryPollOutcome`.
+The names are exported as constants (`TxOBTelemetrySpanName`, `TxOBTelemetryMetricName`, `TxOBTelemetryAttributeKey`, ...). Instrument creation errors surface at construction; runtime telemetry failures never affect processing.
 
-txob surfaces failures while creating metric instruments during processor construction so misconfigured telemetry is visible at startup. Runtime telemetry operations, including span creation and metric recording, are best-effort and will not interrupt event processing if an exporter or SDK callback fails.
+## Using txob with Queues and Job Runners
 
-**2. Use the logger option:**
-
-```typescript
-new EventProcessor({
-  client,
-  handlerMap: handlers,
-  logger: myLogger, // Logs all processing activity
-});
-```
-
-**3. Query the events table:**
-
-```sql
--- Pending events
-SELECT COUNT(*) FROM events WHERE processed_at IS NULL;
-
--- Failed events (max errors reached)
-SELECT * FROM events WHERE errors >= 5 AND processed_at IS NOT NULL;
-
--- Events by type
-SELECT type, COUNT(*) FROM events GROUP BY type;
-
--- Average processing time (requires timestamp tracking)
-SELECT type, AVG(processed_at - timestamp) as avg_duration
-FROM events WHERE processed_at IS NOT NULL
-GROUP BY type;
-```
-
-**4. Create monitoring events:**
+txob is the reliable bridge between your database and everything else. To hand work to Kafka, SQS, BullMQ or pg-boss, publish from a handler and use the event id for deduplication:
 
 ```typescript
-onEventMaxErrorsReached: async ({ event, txClient }) => {
-  await txClient.createEvent({
-    id: randomUUID(),
-    type: "EventFailed",
-    data: { originalEvent: event },
-    correlation_id: event.correlation_id,
-    handler_results: {},
-    errors: 0,
-  });
-
-  // Send to monitoring service
-  await monitoring.recordFailure(event);
-};
-```
-
-### Can I use this with TypeScript?
-
-Yes! txob is written in TypeScript and provides full type safety, including typed event payloads:
-
-```typescript
-import { z } from "zod";
-import {
-  createEventHandlerMap,
-  createEventProcessor,
-  type TxOBEventSchemaMap,
-} from "txob";
-import { createProcessorClient } from "txob/pg";
-
-const eventSchemas = {
-  UserCreated: z.object({ userId: z.string().uuid(), email: z.string().email() }),
-  OrderPlaced: z.object({ orderId: z.string().uuid(), amount: z.number() }),
-} satisfies TxOBEventSchemaMap<"UserCreated" | "OrderPlaced">;
-
-const handlers = createEventHandlerMap({
-  eventSchemas,
-  handlerMap: {
-    UserCreated: {
-      sendWelcomeEmail: async (event) => {
-        event.data.email; // string
-      },
-    },
-    OrderPlaced: {
-      sendReceipt: async (event) => {
-        event.data.amount; // number
-      },
-    },
-    // Missing an event type? TypeScript error
+UserCreated: {
+  toKafka: async (event) => {
+    await producer.send({ topic: "users", messages: [{ key: event.id, value: JSON.stringify(event.data) }] });
   },
-});
-
-const processor = createEventProcessor({
-  eventSchemas,
-  client: createProcessorClient({ querier: client, eventSchemas }),
-  handlerMap: handlers,
-});
+  toBullMQ: async (event) => {
+    await queue.add("UserCreated", event.data, { jobId: event.id }); // re-adds are no-ops
+  },
+},
 ```
-
-### What's the performance impact?
-
-**Database Impact:**
-
-- Without wakeup signals: one SELECT query per polling interval (default: every 5 seconds)
-- With wakeup signals: SELECTs are driven by inserts (throttled by `wakeupThrottleMs`); fallback poll only fires if no wakeup signal arrives within `wakeupTimeoutMs`
-- One SELECT + UPDATE per event processed
-- With proper indexes, queries are very fast (< 10ms typically)
-
-**Processing Latency:**
-
-- With wakeup signals (Postgres NOTIFY / MongoDB Change Streams): typically tens of milliseconds — bounded by `wakeupThrottleMs` (default 1s) during bursts
-- Polling-only: average `pollingIntervalMs / 2` (~2.5s with the 5s default), worst case `pollingIntervalMs`
-
-**Throughput:**
-
-- Single processor: 10-100 events/second typical, primarily bounded by handler speed and `maxEventConcurrency`
-- Aggregate: scales near-linearly with processor count via `FOR UPDATE SKIP LOCKED` (Postgres) / per-document locking (MongoDB), no coordination required
-- Production deployments can reach **1k-10k+ events/second** on a single well-tuned Postgres/MongoDB
-- Ultimate ceilings are the same as any message-queue consumer: handler efficiency, downstream-system capacity, and database write throughput
-- Where message queues genuinely win: fan-out / pub-sub to many independent consumers, cross-region replication, and dedicated burst buffering — not raw single-stream throughput
-
-**Optimization:**
-
-- Use a `wakeupEmitter` for low-latency processing without aggressive polling
-- Lower `pollingIntervalMs` for lower latency without wakeup signals (at cost of more queries)
-- Increase `maxEventConcurrency` for higher throughput
-- Run multiple processors for horizontal scaling
-
-### How does horizontal scaling work?
-
-Run multiple processor instances (same code, different processes/machines):
-
-```bash
-# Machine 1
-node processor.js
-
-# Machine 2
-node processor.js
-
-# Machine 3
-node processor.js
-```
-
-Each processor will:
-
-1. Query for unprocessed events
-2. Lock events using `FOR UPDATE SKIP LOCKED`
-3. Process locked events
-4. Release locks on commit/rollback
-
-**Key mechanism:** `FOR UPDATE SKIP LOCKED` ensures each event is locked by only one processor. Other processors skip locked rows and process different events.
-
-**No coordination needed** - processors don't need to know about each other. The database handles coordination.
-
-### Can I prioritize certain events?
-
-Yes, modify the query in your custom client:
-
-```typescript
-// Custom client with priority
-const getEventsToProcess = async (opts) => {
-  const events = await client.query(
-    `SELECT id, errors FROM events
-     WHERE processed_at IS NULL
-     AND (backoff_until IS NULL OR backoff_until < NOW())
-     AND errors < $1
-     ORDER BY priority DESC, timestamp ASC  -- High priority first
-     LIMIT 100`,
-    [opts.maxErrors],
-  );
-  return events.rows;
-};
-```
-
-Add a `priority` column to your events table.
 
 ## When to Use txob
 
-### ✅ Use txob when:
+**Use txob when:**
 
-- You need **guaranteed event delivery** (can't lose events)
-- You want to avoid **distributed transactions** (2PC, Saga)
-- You're already using **PostgreSQL or MongoDB**
-- You need **at-least-once delivery** semantics
-- You can make handlers **idempotent**
-- You're building **reliable background processing**
-- You want **simple infrastructure** (no separate message queue)
-- You need **horizontal scalability** without coordination
-- You want **near-realtime processing** without standing up extra infra — wakeup signals (Postgres NOTIFY / MongoDB Change Streams) deliver events within tens of ms while keeping ACID guarantees
+- you need side effects to happen reliably after a database commit
+- you want retries, backoff and concurrency control per side effect without running a separate queue
+- your handlers can be made idempotent
 
-### ⚠️ Consider alternatives when:
+**Consider alternatives when:**
 
-- You need **exactly-once semantics** (use Kafka with transactions)
-- You need **hard real-time processing** (sub-10ms tail latency) - use message queue
-- You need **fan-out / pub-sub** to many independent consumers - use message broker (txob handlers all run in the same processor process)
-- You need **sustained throughput beyond your database's write capacity** - use a dedicated message system
-- You already have **message queue infrastructure** you're happy with
-- You can't make handlers **idempotent**
-- You need **complex routing** or pub/sub patterns - use message broker
-
-### Comparison with alternatives:
-
-| Feature                | txob                   | RabbitMQ         | Kafka            | AWS SQS         |
-| ---------------------- | ---------------------- | ---------------- | ---------------- | --------------- |
-| Infrastructure         | Database only          | Separate service | Separate cluster | Managed service |
-| Consistency            | Strong (ACID)          | Eventual         | Eventual         | Eventual        |
-| Latency                | ~10s of ms with wakeup signals, ~5s polling-only | ~10ms            | ~10ms            | ~1s             |
-| Throughput             | 10-100/s per processor; 1k-10k+/s aggregate (DB-bound) | 10k+/s           | 100k+/s          | 3k/s            |
-| Horizontal scaling     | ✅ Yes                 | ✅ Yes           | ✅ Yes           | ✅ Yes          |
-| Exactly-once           | ❌ No                  | ❌ No            | ✅ Yes           | ❌ No           |
-| Operational complexity | Low                    | Medium           | High             | Low             |
-| Cost                   | DB storage             | Self-hosted      | Self-hosted      | Pay per request |
+- you need exactly-once semantics or ordered streams (Kafka)
+- throughput exceeds what your database can absorb in writes
+- you need fan-out to many independent consumer services (a message broker; txob can feed one)
 
 ## Contributing
 
-Contributions are welcome! To contribute:
+Run `yarn test` for unit tests and the in-memory store. The store tests run against real databases when their URL is set: `TXOB_TEST_PG_URL`, `TXOB_TEST_MONGO_URL` (a replica set), `TXOB_TEST_REDIS_URL` and `TXOB_TEST_DYNAMODB_URL` (see `.github/workflows/coverage.yml` for the containers). Run `yarn test:prepare` first to generate the Prisma Client the ORM adapter tests use.
 
-1. **Fork the repository**
-2. **Create a feature branch:** `git checkout -b feature/my-feature`
-3. **Make your changes** with tests
-4. **Run tests:** `npm test`
-5. **Run linting:** `npm run format`
-6. **Commit your changes:** `git commit -m "Add my feature"`
-7. **Push to your fork:** `git push origin feature/my-feature`
-8. **Open a Pull Request**
+If your change affects users, add a changeset with `yarn changeset`: pick patch, minor or major, and describe the change for the changelog.
 
-**Guidelines:**
-
-- Add tests for new features
-- Update documentation for API changes
-- Follow existing code style
-- Keep PRs focused on a single concern
-
-## Examples
-
-See the [examples](./examples) directory for complete working examples:
-
-- **[PostgreSQL example](./examples/pg)** - HTTP API with user creation and email sending
-- More examples coming soon!
-
-## Support & Community
-
-- 📖 **Documentation:** You're reading it!
-- 🐛 **Bug Reports:** [GitHub Issues](https://github.com/osbytes/txob/issues)
-
-## Learn More
-
-- [Transactional Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html) - Detailed explanation of the pattern
-- [Implementing the Outbox Pattern](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/) - Debezium blog post
-- [Event-Driven Architecture](https://martinfowler.com/articles/201701-event-driven.html) - Martin Fowler
+**Releasing** is automated with [Changesets](https://github.com/changesets/changesets). When changesets land on `main`, the release workflow opens a "Version Packages" PR that bumps the version and updates `CHANGELOG.md`. Merging that PR publishes to npm with provenance and creates a GitHub release.
 
 ## License
 
-MIT © [Dillon Streator](https://github.com/dillonstreator)
-
-## Acknowledgments
-
-Implements the [Transactional Outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) microservices patterns.
+MIT

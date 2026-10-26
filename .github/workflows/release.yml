@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# One release run at a time; a newer push to main supersedes a queued one
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write # push the version branch and tags, create GitHub releases
+  pull-requests: write # open and update the "Version Packages" PR
+  id-token: write # npm trusted publishing (OIDC) and provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships with npm 10
+      - name: Update npm
+        run: npm install -g npm@11
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # With pending changesets, opens or updates the "Version Packages" PR. When that PR is
+      # merged (no changesets left, version not yet on npm), builds and publishes to npm.
+      - name: Create release PR or publish to npm
+        uses: changesets/action@v1
+        with:
+          version: yarn version-packages
+          publish: yarn release
+          commit: "chore: version packages"
+          title: "chore: version packages"
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

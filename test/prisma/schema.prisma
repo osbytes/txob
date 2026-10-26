@@ -1,0 +1,16 @@
+// Prisma Client for the adapter tests. txob's own tables live in a separate Postgres schema
+// that Prisma doesn't manage; `note` is a stand-in for an app's own model.
+generator client {
+  provider     = "prisma-client"
+  output       = "./generated"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Note {
+  id   Int    @id @default(autoincrement())
+  body String
+}

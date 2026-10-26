@@ -4,3 +4,4 @@ dist
 coverage
 *.tsbuildinfo
 tsconfig.tsbuildinfo
+test/prisma/generated

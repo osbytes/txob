@@ -53,72 +53,54 @@ export type TxOBTelemetry = {
 export type TxOBTelemetryInstruments = {
   tracer?: TxOBTelemetryTracer;
   attributes?: TxOBTelemetryAttributes;
-  eventCounter?: TxOBTelemetryCounter;
-  eventDuration?: TxOBTelemetryHistogram;
-  handlerCounter?: TxOBTelemetryCounter;
-  handlerDuration?: TxOBTelemetryHistogram;
+  fanoutCounter?: TxOBTelemetryCounter;
+  deliveryCounter?: TxOBTelemetryCounter;
+  deliveryDuration?: TxOBTelemetryHistogram;
   pollCounter?: TxOBTelemetryCounter;
   pollDuration?: TxOBTelemetryHistogram;
 };
 
 export const TxOBTelemetrySpanName = {
   Poll: "txob.poll",
-  EventProcess: "txob.event.process",
-  HandlerProcess: "txob.handler.process",
+  DeliveryProcess: "txob.delivery.process",
 } as const;
 
 export const TxOBTelemetryMetricName = {
   PollCount: "txob.poll.count",
   PollDuration: "txob.poll.duration",
-  EventProcessingCount: "txob.event.processing.count",
-  EventProcessingDuration: "txob.event.processing.duration",
-  HandlerProcessingCount: "txob.handler.processing.count",
-  HandlerProcessingDuration: "txob.handler.processing.duration",
+  FanoutCount: "txob.fanout.count",
+  DeliveryProcessingCount: "txob.delivery.processing.count",
+  DeliveryProcessingDuration: "txob.delivery.processing.duration",
 } as const;
 
 export const TxOBTelemetryAttributeKey = {
   EventId: "txob.event.id",
   EventType: "txob.event.type",
   EventCorrelationId: "txob.event.correlation_id",
-  EventErrors: "txob.event.errors",
-  EventOutcome: "txob.event.outcome",
   HandlerName: "txob.handler.name",
-  HandlerOutcome: "txob.handler.outcome",
+  DeliveryAttempt: "txob.delivery.attempt",
+  DeliveryOutcome: "txob.delivery.outcome",
   PollOutcome: "txob.poll.outcome",
-  QueueSize: "txob.queue.size",
-  QueueMaxSize: "txob.queue.max_size",
-  EventsFound: "txob.events.found",
-  EventsQueued: "txob.events.queued",
+  ActiveDeliveries: "txob.deliveries.active",
+  EventsFannedOut: "txob.events.fanned_out",
+  DeliveriesClaimed: "txob.deliveries.claimed",
 } as const;
 
-export const TxOBTelemetryEventOutcome = {
+export const TxOBTelemetryDeliveryOutcome = {
   Success: "success",
-  Error: "error",
-  MaxErrors: "max_errors",
-  SkippedLocked: "skipped.locked",
-  SkippedProcessed: "skipped.processed",
-  SkippedMaxErrors: "skipped.max_errors",
-} as const;
-
-export const TxOBTelemetryHandlerOutcome = {
-  Success: "success",
-  Error: "error",
-  Unprocessable: "unprocessable",
-  SkippedProcessed: "skipped.processed",
-  SkippedUnprocessable: "skipped.unprocessable",
+  Retry: "retry",
+  Dead: "dead",
+  LeaseLost: "lease_lost",
+  Released: "released",
 } as const;
 
 export const TxOBTelemetryPollOutcome = {
   Success: "success",
   Error: "error",
-  SkippedAlreadyPolling: "skipped.already_polling",
-  SkippedQueueFull: "skipped.queue_full",
 } as const;
 
-export type TxOBTelemetryEventOutcome =
-  (typeof TxOBTelemetryEventOutcome)[keyof typeof TxOBTelemetryEventOutcome];
-export type TxOBTelemetryHandlerOutcome =
-  (typeof TxOBTelemetryHandlerOutcome)[keyof typeof TxOBTelemetryHandlerOutcome];
+export type TxOBTelemetryDeliveryOutcome =
+  (typeof TxOBTelemetryDeliveryOutcome)[keyof typeof TxOBTelemetryDeliveryOutcome];
 export type TxOBTelemetryPollOutcome =
   (typeof TxOBTelemetryPollOutcome)[keyof typeof TxOBTelemetryPollOutcome];
 
@@ -145,31 +127,25 @@ export const createTelemetryInstruments = (
   return {
     tracer: telemetry?.tracer,
     attributes: telemetry?.attributes,
-    eventCounter: telemetry?.meter?.createCounter(
-      TxOBTelemetryMetricName.EventProcessingCount,
+    fanoutCounter: telemetry?.meter?.createCounter(
+      TxOBTelemetryMetricName.FanoutCount,
       {
-        description: "Number of outbox event processing attempts by outcome.",
+        description:
+          "Number of outbox events fanned out to handler deliveries.",
         unit: "{event}",
       },
     ),
-    eventDuration: telemetry?.meter?.createHistogram(
-      TxOBTelemetryMetricName.EventProcessingDuration,
+    deliveryCounter: telemetry?.meter?.createCounter(
+      TxOBTelemetryMetricName.DeliveryProcessingCount,
       {
-        description: "Duration of outbox event processing.",
-        unit: "ms",
+        description: "Number of handler delivery attempts by outcome.",
+        unit: "{delivery}",
       },
     ),
-    handlerCounter: telemetry?.meter?.createCounter(
-      TxOBTelemetryMetricName.HandlerProcessingCount,
+    deliveryDuration: telemetry?.meter?.createHistogram(
+      TxOBTelemetryMetricName.DeliveryProcessingDuration,
       {
-        description: "Number of outbox handler processing attempts by outcome.",
-        unit: "{handler}",
-      },
-    ),
-    handlerDuration: telemetry?.meter?.createHistogram(
-      TxOBTelemetryMetricName.HandlerProcessingDuration,
-      {
-        description: "Duration of outbox event handler execution.",
+        description: "Duration of handler delivery attempts.",
         unit: "ms",
       },
     ),
@@ -242,9 +218,10 @@ export const recordTelemetryCounter = (
   counter: TxOBTelemetryCounter | undefined,
   telemetry: TxOBTelemetryInstruments | undefined,
   attributes?: TxOBTelemetryAttributes,
+  value: number = 1,
 ): void => {
   suppressTelemetryRuntimeError(() => {
-    counter?.add(1, mergeTelemetryAttributes(telemetry, attributes));
+    counter?.add(value, mergeTelemetryAttributes(telemetry, attributes));
   }, undefined);
 };
 

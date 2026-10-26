@@ -1,71 +1,31 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
-import pg from "pg";
-import dotenv from "dotenv";
 import gracefulShutdown from "http-graceful-shutdown";
-import { eventSchemas, eventTypes } from "./events.js";
-dotenv.config();
+import { migrate } from "../../src/pg/index.js";
+import { outbox, pool } from "./events.js";
 
-export async function migrate(client: pg.Client): Promise<void> {
-  await client.query(`CREATE TABLE IF NOT EXISTS events (
-    id UUID,
-    timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    type VARCHAR(255) NOT NULL,
-    data JSONB,
-    correlation_id UUID,
-    handler_results JSONB,
-    errors INTEGER,
-    backoff_until TIMESTAMPTZ,
-    processed_at TIMESTAMPTZ
-)`);
-  await client.query(`CREATE TABLE IF NOT EXISTS activity (
-    id UUID,
+const main = async (): Promise<void> => {
+  await migrate(pool);
+  await pool.query(`CREATE TABLE IF NOT EXISTS activity (
+    id UUID PRIMARY KEY,
     timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     ip TEXT,
     ua TEXT,
     method TEXT,
     path TEXT,
     correlation_id UUID
-)`);
-  // Primary index for getEventsToProcess query (most critical)
-  // This partial index only includes unprocessed events, keeping it small and fast
-  await client.query(
-    `CREATE INDEX IF NOT EXISTS idx_events_processing ON events(processed_at, backoff_until, errors) WHERE processed_at IS NULL`,
-  );
-  // Index for lookups by id (if id is not already the primary key)
-  await client.query(
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_id ON events(id)`,
-  );
-  // Optional: Index for correlation_id if you frequently query by correlation
-  await client.query(
-    `CREATE INDEX IF NOT EXISTS idx_events_correlation_id ON events(correlation_id)`,
-  );
-}
-
-const main = async (): Promise<void> => {
-  const client = new pg.Client({
-    user: process.env.POSTGRES_USER || 'outbox',
-    password: process.env.POSTGRES_PASSWORD || 'outbox',
-    database: process.env.POSTGRES_DB || 'outbox',
-    port: parseInt(process.env.POSTGRES_PORT || "5434"),
-  });
-  await client.connect();
-  await migrate(client);
+  )`);
 
   const server = http.createServer(async (req, res) => {
     const correlationId = randomUUID();
+    const client = await pool.connect();
     try {
       const activityId = randomUUID();
       await client.query("BEGIN");
       await client.query(
-        `INSERT INTO activity (id, timestamp, ip, ua, method, path, correlation_id) VALUES (
-                $1, $2, $3, $4, $5, $6, $7
-            )`,
+        `INSERT INTO activity (id, ip, ua, method, path, correlation_id) VALUES ($1, $2, $3, $4, $5, $6)`,
         [
           activityId,
-          new Date(),
           req.socket.remoteAddress,
           req.headers["user-agent"],
           req.method,
@@ -73,21 +33,16 @@ const main = async (): Promise<void> => {
           correlationId,
         ],
       );
-      await client.query(
-        `INSERT INTO events (id, type, data, correlation_id, handler_results, errors) VALUES (
-                $1, $2, $3, $4, $5, $6
-            )`,
-        [
-          randomUUID(),
-          eventTypes.ResourceSaved,
-          eventSchemas.ResourceSaved.parse({
-            type: "activity",
-            id: activityId,
-          }),
-          correlationId,
-          {},
-          0,
-        ],
+      // Committed atomically with the activity row, or not at all
+      await outbox.publish(
+        client,
+        "ResourceSaved",
+        {
+          type: "activity",
+          id: activityId,
+          accountId: `acct-${Math.floor(Math.random() * 5)}`,
+        },
+        { correlation_id: correlationId },
       );
       await client.query("COMMIT");
       res.statusCode = 201;
@@ -95,20 +50,18 @@ const main = async (): Promise<void> => {
       await client.query("ROLLBACK");
       console.log(e);
       res.statusCode = 500;
+    } finally {
+      client.release();
     }
     res.end();
   });
   const port = process.env.PORT || 3003;
   server.listen(port, () => console.log(`listening on ${port}`));
 
-  gracefulShutdown(server);
+  gracefulShutdown(server, { finally: () => void pool.end() });
 };
 
-const currentFile = fileURLToPath(import.meta.url);
-const mainFile = resolve(process.argv[1]);
-if (currentFile === mainFile) {
-  await main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
-}
+await main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

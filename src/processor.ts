@@ -1,11 +1,31 @@
-import { getDate } from "./date.js";
-import { sleep } from "./sleep.js";
-import pLimit from "p-limit";
-import { deepClone } from "./clone.js";
-import PQueue from "p-queue";
-import { ErrorUnprocessableEventHandler, TxOBError } from "./error.js";
 import { throttle } from "throttle-debounce";
-import type { StandardSchemaV1 } from "@standard-schema/spec";
+import {
+  ErrorUnprocessableEventHandler,
+  TxOBError,
+  TxOBTimeoutError,
+  TxOBValidationError,
+} from "./error.js";
+import {
+  compileHandlerMap,
+  type CompiledHandler,
+  type TxOBHandlerDefaults,
+  type TxOBHandlerMap,
+  type TxOBHandlerTuning,
+  type TxOBHandlerTuningMap,
+} from "./handlers.js";
+import {
+  createOutbox,
+  validateEventData,
+  type TxOBBoundPublish,
+  type TxOBPublish,
+} from "./outbox.js";
+import { sleep } from "./sleep.js";
+import {
+  deliveryKey,
+  type TxOBHandlerSlot,
+  type TxOBNewDelivery,
+  type TxOBStore,
+} from "./store.js";
 import {
   createTelemetryInstruments,
   endTelemetrySpan,
@@ -14,926 +34,311 @@ import {
   setTelemetrySpanAttributes,
   startTelemetrySpan,
   TxOBTelemetryAttributeKey,
-  TxOBTelemetryEventOutcome,
-  TxOBTelemetryHandlerOutcome,
+  TxOBTelemetryDeliveryOutcome,
   TxOBTelemetryPollOutcome,
   TxOBTelemetrySpanName,
   type TxOBTelemetry,
-  type TxOBTelemetryAttributes,
   type TxOBTelemetryInstruments,
-  type TxOBTelemetrySpan,
 } from "./telemetry.js";
+import type {
+  Logger,
+  TxOBDelivery,
+  TxOBEventFromSchemas,
+  TxOBEventSchemaMap,
+  TxOBSerializedError,
+  WakeupEmitter,
+} from "./types.js";
 
-type TxOBEventHandlerResult = {
-  processed_at?: Date;
-  unprocessable_at?: Date;
-  errors?: { error: unknown; timestamp: Date }[];
-};
-
-export type TxOBEventData = Record<string, unknown>;
-
-export type TxOBEvent<TxOBEventType extends string, TData = TxOBEventData> = {
-  id: string;
-  timestamp: Date;
-  type: TxOBEventType;
-  data: TData;
-  correlation_id: string;
-  handler_results: Record<string, TxOBEventHandlerResult>;
-  errors: number;
-  backoff_until?: Date | null;
-  processed_at?: Date;
-};
-
-export type TxOBEventDataMap<TxOBEventType extends string> = Record<
-  TxOBEventType,
-  TxOBEventData
->;
-
-type TxOBEventByType<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType>,
+export type TxOBDeliveryDeadContext<
+  TEventSchemas extends TxOBEventSchemaMap,
+  TTx,
 > = {
-  [TType in TxOBEventType]: TxOBEvent<TType, TEventDataMap[TType]>;
-}[TxOBEventType];
+  event: TxOBEventFromSchemas<TEventSchemas>;
+  handler: string;
+  attempts: number;
+  error: unknown;
+  /** Publish follow-up events in the same transaction that marks the delivery dead. */
+  publish: TxOBBoundPublish<TEventSchemas>;
+  /** The store transaction the delivery is being marked dead in. */
+  tx: TTx;
+};
 
-export type TxOBStandardSchema = StandardSchemaV1<unknown, TxOBEventData>;
-
-export type TxOBEventSchemaMap<TxOBEventType extends string> = Record<
-  TxOBEventType,
-  TxOBStandardSchema
->;
-
-export type TxOBSchemaOutput<TSchema extends TxOBStandardSchema> =
-  TSchema extends StandardSchemaV1<unknown, infer TOutput> ? TOutput : never;
-
-type TxOBEventDataMapFromSchemas<
-  TEventSchemas extends TxOBEventSchemaMap<string>,
+export type CreateEventProcessorOpts<
+  TEventSchemas extends TxOBEventSchemaMap,
+  TTx,
+  THandlerMap extends TxOBHandlerMap<TEventSchemas> =
+    TxOBHandlerMap<TEventSchemas>,
 > = {
-  [TType in keyof TEventSchemas & string]: TxOBSchemaOutput<TEventSchemas[TType]>;
-};
-
-type TxOBEventHandlerMapFromSchemas<
-  TEventSchemas extends TxOBEventSchemaMap<string>,
-> = TxOBEventHandlerMap<
-  keyof TEventSchemas & string,
-  TxOBEventDataMapFromSchemas<TEventSchemas>
->;
-
-type TxOBEventTypeFromSchemas<TEventSchemas extends TxOBEventSchemaMap<string>> =
-  keyof TEventSchemas & string;
-
-type TxOBEventHandlerOpts = {
-  signal?: AbortSignal;
-};
-
-export type TxOBEventHandler<
-  TxOBEventType extends string = string,
-  TData = TxOBEventData,
-> = (
-  event: TxOBEvent<TxOBEventType, TData>,
-  opts: TxOBEventHandlerOpts,
-) => Promise<void>;
-
-export type TxOBEventHandlerMap<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType> = TxOBEventDataMap<TxOBEventType>,
-> = {
-  [TType in TxOBEventType]: {
-    [key: string]: TxOBEventHandler<TType, TEventDataMap[TType]>;
-  };
-};
-
-export type CreateEventProcessorOptsFromSchemas<
-  TEventSchemas extends TxOBEventSchemaMap<string>,
-> = Omit<
-  Partial<
-    TxOBProcessEventsOpts<
-      TxOBEventTypeFromSchemas<TEventSchemas>,
-      TxOBEventDataMapFromSchemas<TEventSchemas>
-    >
-  >,
-  "signal" | "telemetry"
-> & {
-  pollingIntervalMs?: number;
-  wakeupTimeoutMs?: number;
-  wakeupThrottleMs?: number;
-  wakeupEmitter?: WakeupEmitter;
-  telemetry?: TxOBTelemetry;
+  store: TxOBStore<TTx>;
   eventSchemas: TEventSchemas;
-  client: TxOBProcessorClient<
-    TxOBEventTypeFromSchemas<TEventSchemas>,
-    TxOBEventDataMapFromSchemas<TEventSchemas>
-  >;
-  handlerMap: TxOBEventHandlerMapFromSchemas<TEventSchemas>;
-};
-
-export type TxOBProcessorClientOpts = {
-  signal?: AbortSignal;
-  maxErrors: number;
-};
-
-export interface WakeupEmitter {
-  on(event: "wakeup", listener: () => void): void;
-  off(event: "wakeup", listener: () => void): void;
-  close(): Promise<void>;
-}
-
-export interface TxOBProcessorClient<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType> = TxOBEventDataMap<TxOBEventType>,
-> {
-  getEventsToProcess(
-    opts: TxOBProcessorClientOpts,
-  ): Promise<Pick<TxOBEventByType<TxOBEventType, TEventDataMap>, "id" | "errors">[]>;
-  transaction(
-    fn: (
-      txProcessorClient: TxOBTransactionProcessorClient<TxOBEventType, TEventDataMap>,
-    ) => Promise<void>,
-  ): Promise<void>;
-}
-
-export interface TxOBTransactionProcessorClient<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType> = TxOBEventDataMap<TxOBEventType>,
-> {
-  getEventByIdForUpdateSkipLocked(
-    eventId: TxOBEventByType<TxOBEventType, TEventDataMap>["id"],
-    opts: TxOBProcessorClientOpts,
-  ): Promise<TxOBEventByType<TxOBEventType, TEventDataMap> | null>;
-  updateEvent(event: TxOBEventByType<TxOBEventType, TEventDataMap>): Promise<void>;
-  createEvent(
-    event: Omit<
-      TxOBEventByType<TxOBEventType, TEventDataMap>,
-      "processed_at" | "backoff_until"
-    >,
-  ): Promise<void>;
-}
-
-export type TxOBBackoffContext<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType> = TxOBEventDataMap<TxOBEventType>,
-> = {
-  attempt: number;
-  error?: unknown;
-  errors: readonly unknown[];
-  event: Readonly<TxOBEventByType<TxOBEventType, TEventDataMap>>;
-  maxErrors: number;
-};
-
-export const defaultBackoff = ({
-  attempt,
-}: TxOBBackoffContext<string>): Date => {
-  const baseDelayMs = 1000;
-  const maxDelayMs = 1000 * 60;
-  const backoffMs = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-  const retryTimestamp = new Date(Date.now() + backoffMs);
-
-  return retryTimestamp;
-};
-const defaultPollingIntervalMs = 5_000;
-const defaultMaxErrors = 5;
-const defaultMaxEventConcurrency = 20;
-const defaultMaxHandlerConcurrency = 10;
-const defaultMaxQueuedEvents = 500;
-const defaultWakeupTimeoutMs = 60_000;
-const defaultWakeupThrottleMs = 1_000;
-
-type TxOBProcessEventsOpts<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType>,
-> = {
-  maxErrors: number;
-  backoff: (context: TxOBBackoffContext<TxOBEventType, TEventDataMap>) => Date;
-  signal?: AbortSignal;
+  handlerMap: THandlerMap;
+  /** Defaults applied to every handler that doesn't override them. */
+  handlerDefaults?: TxOBHandlerDefaults;
+  /** Maximum deliveries running in this processor at once. Default: 20. */
+  concurrency?: number;
+  /** Lease duration for claimed events and deliveries. Leases are renewed while work is in progress. Default: 30s. */
+  leaseMs?: number;
+  /** Maximum events fanned out per poll. Default: 100. */
+  fanoutBatchSize?: number;
+  /** Poll interval. Wakeup signals trigger polls in between. Default: 5s. */
+  pollingIntervalMs?: number;
+  wakeupEmitter?: WakeupEmitter;
+  /** Minimum time between wakeup-triggered polls. Default: 100ms. */
+  wakeupThrottleMs?: number;
   logger?: Logger;
-  maxEventConcurrency?: number;
-  maxHandlerConcurrency?: number;
-  maxQueuedEvents?: number;
-  onEventMaxErrorsReached?: (opts: {
-    event: Readonly<TxOBEventByType<TxOBEventType, TEventDataMap>>;
-    txClient: TxOBTransactionProcessorClient<TxOBEventType, TEventDataMap>;
-    signal?: AbortSignal;
-  }) => Promise<void>;
-  telemetry?: TxOBTelemetryInstruments;
+  telemetry?: TxOBTelemetry;
+  /**
+   * Called in the same transaction that marks a delivery dead (max attempts reached,
+   * unprocessable error, or invalid event data). If it throws, the delivery is left as is and
+   * retried once its lease expires.
+   */
+  onDeliveryDead?: (
+    ctx: TxOBDeliveryDeadContext<TEventSchemas, TTx>,
+  ) => Promise<void>;
 };
-
-const processEvent = async <
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType>,
->({
-  client,
-  handlerMap,
-  unlockedEvent,
-  opts,
-}: {
-  client: TxOBProcessorClient<TxOBEventType, TEventDataMap>;
-  handlerMap: TxOBEventHandlerMap<TxOBEventType, TEventDataMap>;
-  unlockedEvent: Pick<TxOBEventByType<TxOBEventType, TEventDataMap>, "id" | "errors">;
-  opts?: Partial<TxOBProcessEventsOpts<TxOBEventType, TEventDataMap>>;
-}): Promise<{ backoffUntil?: Date }> => {
-  const {
-    logger,
-    maxErrors = defaultMaxErrors,
-    signal,
-    backoff = defaultBackoff,
-    maxHandlerConcurrency = defaultMaxHandlerConcurrency,
-    onEventMaxErrorsReached,
-    telemetry,
-  } = opts ?? {};
-  const eventStartedAt = Date.now();
-
-  if (signal?.aborted) {
-    return {};
-  }
-  if (unlockedEvent.errors >= maxErrors) {
-    // Potential issue with client configuration on finding unprocessed events
-    // Events with maximum allowed errors should not be returned from `getEventsToProcess`
-    logger?.warn(
-      {
-        eventId: unlockedEvent.id,
-        errors: unlockedEvent.errors,
-        maxErrors,
-      },
-      "unexpected event with max errors returned from `getEventsToProcess`",
-    );
-    recordTelemetryCounter(telemetry?.eventCounter, telemetry, {
-      [TxOBTelemetryAttributeKey.EventOutcome]:
-        TxOBTelemetryEventOutcome.SkippedMaxErrors,
-    });
-    recordTelemetryDuration(
-      telemetry?.eventDuration,
-      telemetry,
-      eventStartedAt,
-      {
-        [TxOBTelemetryAttributeKey.EventOutcome]:
-          TxOBTelemetryEventOutcome.SkippedMaxErrors,
-      },
-    );
-    return {};
-  }
-
-  let backoffUntil: Date | undefined;
-  let eventSpan: TxOBTelemetrySpan | undefined;
-  let eventError: unknown;
-  let eventOutcome: TxOBTelemetryEventOutcome | undefined;
-  let eventMetricAttributes: TxOBTelemetryAttributes = {};
-
-  try {
-    await client.transaction(async (txClient) => {
-      const lockedEvent = await txClient.getEventByIdForUpdateSkipLocked(
-        unlockedEvent.id,
-        { signal, maxErrors },
-      );
-      if (!lockedEvent) {
-        eventOutcome = TxOBTelemetryEventOutcome.SkippedLocked;
-        logger?.debug(
-          {
-            eventId: unlockedEvent.id,
-          },
-          "skipping locked or already processed event",
-        );
-        return;
-      }
-
-      eventMetricAttributes = {
-        [TxOBTelemetryAttributeKey.EventType]: lockedEvent.type,
-      };
-      eventSpan = startTelemetrySpan(
-        telemetry,
-        TxOBTelemetrySpanName.EventProcess,
-        {
-          [TxOBTelemetryAttributeKey.EventId]: lockedEvent.id,
-          [TxOBTelemetryAttributeKey.EventType]: lockedEvent.type,
-          [TxOBTelemetryAttributeKey.EventCorrelationId]:
-            lockedEvent.correlation_id,
-          [TxOBTelemetryAttributeKey.EventErrors]: lockedEvent.errors,
-        },
-      );
-
-      // While unlikely, the following two conditions are possible if a concurrent processor finished processing this event or reaching maximum errors between the time
-      // that this processor found the event with `getEventsToProcess` and called `getEventByIdForUpdateSkipLocked`
-      // `getEventByIdForUpdateSkipLocked` should handle this in its query implementation and return null to save resources
-      if (lockedEvent.processed_at) {
-        eventOutcome = TxOBTelemetryEventOutcome.SkippedProcessed;
-        logger?.debug(
-          {
-            eventId: lockedEvent.id,
-            correlationId: lockedEvent.correlation_id,
-          },
-          "skipping already processed event",
-        );
-        return;
-      }
-      if (lockedEvent.errors >= maxErrors) {
-        eventOutcome = TxOBTelemetryEventOutcome.SkippedMaxErrors;
-        logger?.debug(
-          {
-            eventId: lockedEvent.id,
-            correlationId: lockedEvent.correlation_id,
-          },
-          "skipping event with maximum errors",
-        );
-        return;
-      }
-
-      let errored = false;
-
-      const eventHandlerMap = handlerMap[lockedEvent.type] ?? {};
-
-      // Typescript should prevent the caller from passing a handler map that doesn't specify all event types but we'll check for it anyway
-      // This is distinct from an empty handler map for an event type which is valid
-      // We just want the caller to be explicit about the event types they are interested in handling and not accidentally skip events
-      if (!(lockedEvent.type in handlerMap)) {
-        logger?.warn(
-          {
-            eventId: lockedEvent.id,
-            type: lockedEvent.type,
-            correlationId: lockedEvent.correlation_id,
-          },
-          "missing event handler map",
-        );
-        errored = true;
-        lockedEvent.errors = maxErrors;
-      }
-
-      logger?.debug(
-        {
-          eventId: lockedEvent.id,
-          type: lockedEvent.type,
-          correlationId: lockedEvent.correlation_id,
-        },
-        `processing event`,
-      );
-
-      const backoffs: Date[] = [];
-      const backoffErrors: unknown[] = [];
-      let latestBackoffError: unknown;
-
-      const handlerLimit = pLimit(maxHandlerConcurrency);
-      await Promise.allSettled(
-        Object.entries(eventHandlerMap).map(([handlerName, handler]) =>
-          handlerLimit(async (): Promise<void> => {
-            const handlerMetricAttributes = {
-              [TxOBTelemetryAttributeKey.EventType]: lockedEvent.type,
-              [TxOBTelemetryAttributeKey.HandlerName]: handlerName,
-            };
-            const handlerResults =
-              lockedEvent.handler_results[handlerName] ?? {};
-            if (handlerResults.processed_at) {
-              logger?.debug(
-                {
-                  eventId: lockedEvent.id,
-                  type: lockedEvent.type,
-                  handlerName,
-                  correlationId: lockedEvent.correlation_id,
-                },
-                "handler already processed",
-              );
-              recordTelemetryCounter(telemetry?.handlerCounter, telemetry, {
-                ...handlerMetricAttributes,
-                [TxOBTelemetryAttributeKey.HandlerOutcome]:
-                  TxOBTelemetryHandlerOutcome.SkippedProcessed,
-              });
-              return;
-            }
-            if (handlerResults.unprocessable_at) {
-              logger?.debug(
-                {
-                  eventId: lockedEvent.id,
-                  type: lockedEvent.type,
-                  handlerName,
-                  correlationId: lockedEvent.correlation_id,
-                },
-                "handler unprocessable",
-              );
-              recordTelemetryCounter(telemetry?.handlerCounter, telemetry, {
-                ...handlerMetricAttributes,
-                [TxOBTelemetryAttributeKey.HandlerOutcome]:
-                  TxOBTelemetryHandlerOutcome.SkippedUnprocessable,
-              });
-              return;
-            }
-
-            handlerResults.errors ??= [];
-            const handlerStartedAt = Date.now();
-            const handlerSpan = startTelemetrySpan(
-              telemetry,
-              TxOBTelemetrySpanName.HandlerProcess,
-              {
-                [TxOBTelemetryAttributeKey.EventId]: lockedEvent.id,
-                [TxOBTelemetryAttributeKey.EventType]: lockedEvent.type,
-                [TxOBTelemetryAttributeKey.EventCorrelationId]:
-                  lockedEvent.correlation_id,
-                [TxOBTelemetryAttributeKey.HandlerName]: handlerName,
-              },
-            );
-            let handlerOutcome: TxOBTelemetryHandlerOutcome =
-              TxOBTelemetryHandlerOutcome.Success;
-            let handlerError: unknown;
-
-            try {
-              await handler(lockedEvent, { signal });
-              handlerResults.processed_at = getDate();
-              logger?.debug(
-                {
-                  eventId: lockedEvent.id,
-                  type: lockedEvent.type,
-                  handlerName,
-                  correlationId: lockedEvent.correlation_id,
-                },
-                "handler succeeded",
-              );
-            } catch (error) {
-              handlerError = error;
-              latestBackoffError = error;
-              backoffErrors.push(error);
-              logger?.error(
-                {
-                  eventId: lockedEvent.id,
-                  type: lockedEvent.type,
-                  handlerName,
-                  error,
-                  correlationId: lockedEvent.correlation_id,
-                },
-                "handler errored",
-              );
-
-              if (error instanceof ErrorUnprocessableEventHandler) {
-                handlerOutcome = TxOBTelemetryHandlerOutcome.Unprocessable;
-                handlerResults.unprocessable_at = getDate();
-                handlerResults.errors?.push({
-                  error: error.message ?? error,
-                  timestamp: getDate(),
-                });
-                errored = true;
-              } else {
-                handlerOutcome = TxOBTelemetryHandlerOutcome.Error;
-                if (error instanceof TxOBError && error.backoffUntil) {
-                  backoffs.push(error.backoffUntil);
-                }
-
-                errored = true;
-                handlerResults.errors?.push({
-                  error: (error as Error)?.message ?? error,
-                  timestamp: getDate(),
-                });
-              }
-            } finally {
-              const handlerAttributes = {
-                ...handlerMetricAttributes,
-                [TxOBTelemetryAttributeKey.HandlerOutcome]: handlerOutcome,
-              };
-              recordTelemetryCounter(
-                telemetry?.handlerCounter,
-                telemetry,
-                handlerAttributes,
-              );
-              recordTelemetryDuration(
-                telemetry?.handlerDuration,
-                telemetry,
-                handlerStartedAt,
-                handlerAttributes,
-              );
-              endTelemetrySpan(handlerSpan, handlerError);
-            }
-
-            lockedEvent.handler_results[handlerName] = handlerResults;
-          }),
-        ),
-      );
-
-      // Check if all remaining handlers (those that haven't succeeded) are unprocessable
-      // If so, there's nothing left to retry, so set errors to maxErrors to stop processing
-      const remainingHandlers = Object.entries(eventHandlerMap).filter(
-        ([handlerName, _]) => {
-          const result = lockedEvent.handler_results[handlerName];
-          return !result?.processed_at;
-        },
-      );
-
-      const allRemainingHandlersUnprocessable =
-        remainingHandlers.length > 0 &&
-        remainingHandlers.every(([handlerName, _]) => {
-          const result = lockedEvent.handler_results[handlerName];
-          return result?.unprocessable_at;
-        });
-
-      if (allRemainingHandlersUnprocessable) {
-        lockedEvent.errors = maxErrors;
-        errored = true;
-      }
-
-      if (errored) {
-        lockedEvent.errors = Math.min(lockedEvent.errors + 1, maxErrors);
-        const backoffContext: TxOBBackoffContext<TxOBEventType, TEventDataMap> = {
-          attempt: lockedEvent.errors,
-          error: latestBackoffError,
-          errors: backoffErrors,
-          event: deepClone(lockedEvent) as Readonly<
-            TxOBEventByType<TxOBEventType, TEventDataMap>
-          >,
-          maxErrors,
-        };
-        backoffs.push(
-          backoff(backoffContext),
-        );
-        const latestBackoff = backoffs.sort(
-          (a, b) => b.getTime() - a.getTime(),
-        )[0];
-        lockedEvent.backoff_until = latestBackoff;
-        if (lockedEvent.errors === maxErrors) {
-          lockedEvent.backoff_until = null;
-          lockedEvent.processed_at = getDate();
-
-          if (onEventMaxErrorsReached) {
-            try {
-              await onEventMaxErrorsReached({
-                event: deepClone(lockedEvent) as Readonly<
-                  TxOBEventByType<TxOBEventType, TEventDataMap>
-                >,
-                txClient,
-                signal,
-              });
-            } catch (hookError) {
-              logger?.error(
-                {
-                  eventId: lockedEvent.id,
-                  error: hookError,
-                },
-                "error in onEventMaxErrorsReached hook",
-              );
-
-              throw hookError;
-            }
-          }
-        }
-      } else {
-        lockedEvent.backoff_until = null;
-        lockedEvent.processed_at = getDate();
-      }
-
-      eventOutcome = errored
-        ? lockedEvent.errors === maxErrors
-          ? TxOBTelemetryEventOutcome.MaxErrors
-          : TxOBTelemetryEventOutcome.Error
-        : TxOBTelemetryEventOutcome.Success;
-      setTelemetrySpanAttributes(eventSpan, {
-        [TxOBTelemetryAttributeKey.EventOutcome]: eventOutcome,
-        [TxOBTelemetryAttributeKey.EventErrors]: lockedEvent.errors,
-      });
-
-      backoffUntil = lockedEvent.backoff_until ?? undefined;
-
-      await txClient.updateEvent(lockedEvent);
-    });
-  } catch (error) {
-    eventError = error;
-    eventOutcome ??= TxOBTelemetryEventOutcome.Error;
-    throw error;
-  } finally {
-    if (eventOutcome) {
-      const eventAttributes = {
-        ...eventMetricAttributes,
-        [TxOBTelemetryAttributeKey.EventOutcome]: eventOutcome,
-      };
-      recordTelemetryCounter(
-        telemetry?.eventCounter,
-        telemetry,
-        eventAttributes,
-      );
-      recordTelemetryDuration(
-        telemetry?.eventDuration,
-        telemetry,
-        eventStartedAt,
-        eventAttributes,
-      );
-    }
-    endTelemetrySpan(eventSpan, eventError);
-  }
-
-  return { backoffUntil };
-};
-
-export interface Logger {
-  debug(message?: unknown, ...optionalParams: unknown[]): void;
-  info(message?: unknown, ...optionalParams: unknown[]): void;
-  warn(message?: unknown, ...optionalParams: unknown[]): void;
-  error(message?: unknown, ...optionalParams: unknown[]): void;
-}
 
 export interface TxOBProcessor {
   start(): void;
   stop(opts?: { timeoutMs?: number }): Promise<void>;
 }
 
-export class EventProcessor<
-  TxOBEventType extends string,
-  TEventDataMap extends TxOBEventDataMap<TxOBEventType> = TxOBEventDataMap<TxOBEventType>,
-> implements TxOBProcessor {
-  private client: TxOBProcessorClient<TxOBEventType, TEventDataMap>;
-  private handlerMap: TxOBEventHandlerMap<TxOBEventType, TEventDataMap>;
-  private opts: Omit<TxOBProcessEventsOpts<TxOBEventType, TEventDataMap>, "signal"> & {
-    pollingIntervalMs: number;
-    maxQueuedEvents: number;
-    wakeupTimeoutMs: number;
-    wakeupThrottleMs: number;
-  };
-  private abortController: AbortController;
-  private queue: PQueue;
-  private state: "stopped" | "started" | "stopping" = "stopped";
-  private wakeupEmitter?: WakeupEmitter;
-  private wakeupListener?: () => void;
-  private throttledPoll?: ReturnType<typeof throttle>;
-  private lastWakeupTime: number = Date.now();
-  private isPolling: boolean = false;
+/** Runtime settings for `EventProcessor.configure`. */
+export type TxOBProcessorTuning<THandlerMap> = {
+  /** Max deliveries running in this processor at once. Omit to keep the current value. */
+  concurrency?: number;
+  /**
+   * Overrides on top of the handler definitions. Replaces any previously configured overrides;
+   * handlers not listed revert to their definitions. Omit to keep the current overrides.
+   */
+  handlers?: TxOBHandlerTuningMap<THandlerMap>;
+};
 
-  constructor({
-    client,
-    handlerMap,
-    wakeupEmitter,
-    telemetry,
-    ...opts
-  }: Omit<
-    Partial<TxOBProcessEventsOpts<TxOBEventType, TEventDataMap>>,
-    "signal" | "telemetry"
-  > & {
-    pollingIntervalMs?: number;
-    wakeupTimeoutMs?: number;
-    wakeupThrottleMs?: number;
-    wakeupEmitter?: WakeupEmitter;
-    telemetry?: TxOBTelemetry;
-  } & {
-    client: TxOBProcessorClient<TxOBEventType, TEventDataMap>;
-    handlerMap: TxOBEventHandlerMap<TxOBEventType, TEventDataMap>;
-  }) {
-    const _opts = {
-      pollingIntervalMs: defaultPollingIntervalMs,
-      maxErrors: defaultMaxErrors,
-      backoff: defaultBackoff,
-      maxEventConcurrency: defaultMaxEventConcurrency,
-      maxHandlerConcurrency: defaultMaxHandlerConcurrency,
-      maxQueuedEvents: defaultMaxQueuedEvents,
-      wakeupTimeoutMs: defaultWakeupTimeoutMs,
-      wakeupThrottleMs: defaultWakeupThrottleMs,
-      telemetry: createTelemetryInstruments(telemetry),
-      ...opts,
-    };
-    this.client = client;
+export type TxOBEffectiveHandlerConfig = {
+  concurrency: number | null;
+  perKeyConcurrency: number | null;
+  rateLimit: { max: number; durationMs: number } | null;
+  maxAttempts: number;
+  timeoutMs: number | null;
+};
+
+class LeaseLostError extends Error {
+  constructor() {
+    super("delivery lease lost");
+    this.name = "LeaseLostError";
+  }
+}
+
+class ProcessorStoppingError extends Error {
+  constructor() {
+    super("processor stopping");
+    this.name = "ProcessorStoppingError";
+  }
+}
+
+type ActiveDelivery = {
+  delivery: TxOBDelivery;
+  handler: CompiledHandler;
+  controller: AbortController;
+  leaseLost: boolean;
+  /** When the lease runs out unless renewed (ms, local clock). */
+  leaseExpiresAt: number;
+};
+
+/** One attempt: a delivery under a specific lease. */
+const activeKey = (delivery: TxOBDelivery) =>
+  `${deliveryKey(delivery)}|${delivery.lease_token}`;
+
+const maxPriority = 2 ** 31 - 1;
+
+const serializeError = (error: unknown): TxOBSerializedError => ({
+  message: error instanceof Error ? error.message : String(error),
+  name: error instanceof Error ? error.name : undefined,
+  timestamp: new Date().toISOString(),
+});
+
+export class EventProcessor<
+  TEventSchemas extends TxOBEventSchemaMap,
+  TTx = unknown,
+  THandlerMap extends TxOBHandlerMap<TEventSchemas> =
+    TxOBHandlerMap<TEventSchemas>,
+> implements TxOBProcessor {
+  private readonly store: TxOBStore<TTx>;
+  private readonly eventSchemas: TEventSchemas;
+  private readonly handlerMap: THandlerMap;
+  private readonly handlerDefaults?: TxOBHandlerDefaults;
+  private tuning: TxOBHandlerTuningMap<THandlerMap> = {};
+  private handlers!: Map<string, CompiledHandler[]>;
+  private handlersByKey!: Map<string, CompiledHandler>;
+  private readonly publish: TxOBPublish<TEventSchemas, TTx>;
+  private readonly telemetry: TxOBTelemetryInstruments;
+  private readonly opts: Required<
+    Pick<
+      CreateEventProcessorOpts<TEventSchemas, TTx>,
+      | "concurrency"
+      | "leaseMs"
+      | "fanoutBatchSize"
+      | "pollingIntervalMs"
+      | "wakeupThrottleMs"
+    >
+  > &
+    Pick<
+      CreateEventProcessorOpts<TEventSchemas, TTx>,
+      "logger" | "onDeliveryDead" | "wakeupEmitter"
+    >;
+
+  private state: "stopped" | "started" | "stopping" = "stopped";
+  /** Aborted on stop: ends polling and signals handlers. */
+  private abortController = new AbortController();
+  private readonly active = new Map<string, ActiveDelivery>();
+  private readonly timers = new Set<NodeJS.Timeout>();
+  private heartbeat?: NodeJS.Timeout;
+  private throttledTick?: throttle<() => void>;
+  private wakeupListener?: () => void;
+  private ticking?: Promise<void>;
+  private tickAgain = false;
+  private backlog = false;
+  private drained?: () => void;
+
+  constructor(opts: CreateEventProcessorOpts<TEventSchemas, TTx, THandlerMap>) {
+    const {
+      store,
+      eventSchemas,
+      handlerMap,
+      handlerDefaults,
+      telemetry,
+      ...rest
+    } = opts;
+    this.store = store;
+    this.eventSchemas = eventSchemas;
     this.handlerMap = handlerMap;
-    this.wakeupEmitter = wakeupEmitter;
-    this.opts = _opts;
-    this.abortController = new AbortController();
-    this.queue = new PQueue({
-      concurrency: _opts.maxEventConcurrency,
-    });
+    this.handlerDefaults = handlerDefaults;
+    this.applyHandlers(compileHandlerMap(handlerMap, handlerDefaults));
+    this.publish = createOutbox({ eventSchemas, store }).publish;
+    this.telemetry = createTelemetryInstruments(telemetry);
+    this.opts = {
+      concurrency: 20,
+      leaseMs: 30_000,
+      fanoutBatchSize: 100,
+      pollingIntervalMs: 5_000,
+      wakeupThrottleMs: 100,
+      ...rest,
+    };
+    if (!Number.isInteger(this.opts.concurrency) || this.opts.concurrency < 1) {
+      throw new Error("concurrency must be a positive integer");
+    }
+    if (!(this.opts.leaseMs > 0)) {
+      throw new Error("leaseMs must be a positive number");
+    }
   }
 
-  start() {
+  /**
+   * Changes how this processor runs without restarting it. Takes effect from the next claim:
+   * queued deliveries are not tied to the settings they were created under. Attempts already
+   * running keep the settings they started with.
+   *
+   * Declarative and idempotent: applying the same config again changes nothing. Invalid
+   * config throws and leaves the current settings untouched.
+   *
+   * Applies to this processor only. Limits are enforced across processors by the store using
+   * the claiming processor's settings, so apply the same config to every processor (e.g. from
+   * shared config or a feature flag) to keep them consistent.
+   *
+   * @example
+   * ```typescript
+   * processor.configure({
+   *   concurrency: 50,
+   *   handlers: {
+   *     UserCreated: { createStripeCustomer: { concurrency: 20, rateLimit: { max: 100, durationMs: 1_000 } } },
+   *   },
+   * });
+   * ```
+   */
+  configure(config: TxOBProcessorTuning<THandlerMap>): void {
+    const concurrency = config.concurrency ?? this.opts.concurrency;
+    if (!Number.isInteger(concurrency) || concurrency < 1) {
+      throw new Error("concurrency must be a positive integer");
+    }
+    const tuning = config.handlers ?? this.tuning;
+    const handlers = compileHandlerMap(
+      this.handlerMap,
+      this.handlerDefaults,
+      tuning as Record<string, Record<string, TxOBHandlerTuning>>,
+    );
+
+    this.applyHandlers(handlers);
+    this.tuning = tuning;
+    this.opts.concurrency = concurrency;
+    this.opts.logger?.info(
+      { concurrency, handlers: tuning },
+      "processor reconfigured",
+    );
+    // Raised limits should pick up queued work now rather than on the next poll
+    this.requestTick();
+  }
+
+  /** The settings currently in effect, per handler, after overrides. */
+  getConfig(): {
+    concurrency: number;
+    handlers: Record<string, Record<string, TxOBEffectiveHandlerConfig>>;
+  } {
+    const handlers: Record<
+      string,
+      Record<string, TxOBEffectiveHandlerConfig>
+    > = {};
+    for (const handler of this.handlersByKey.values()) {
+      handlers[handler.eventType] ??= {};
+      handlers[handler.eventType][handler.name] = {
+        concurrency: handler.concurrency ?? null,
+        perKeyConcurrency: handler.perKey?.limit ?? null,
+        rateLimit: handler.rateLimit ?? null,
+        maxAttempts: handler.maxAttempts,
+        timeoutMs: handler.timeoutMs ?? null,
+      };
+    }
+    return { concurrency: this.opts.concurrency, handlers };
+  }
+
+  private applyHandlers(handlers: Map<string, CompiledHandler[]>): void {
+    const byKey = new Map<string, CompiledHandler>();
+    for (const list of handlers.values()) {
+      for (const handler of list) {
+        byKey.set(`${handler.eventType}:${handler.name}`, handler);
+      }
+    }
+    this.handlers = handlers;
+    this.handlersByKey = byKey;
+  }
+
+  start(): void {
     if (this.state !== "stopped") {
       this.opts.logger?.warn(`cannot start processor from '${this.state}'`);
       return;
     }
     this.state = "started";
-    this.opts.logger?.debug("processor started");
+    this.abortController = new AbortController();
+    const signal = this.abortController.signal;
 
-    const queuedEventIds: Set<string> = new Set();
+    this.heartbeat = setInterval(
+      () => void this.extendLeases(),
+      Math.max(this.opts.leaseMs / 3, 10),
+    );
 
-    // Poll function that can be called from wakeup signals or polling loop
-    const poll = async (): Promise<void> => {
-      if (this.abortController.signal.aborted) {
-        return;
-      }
-
-      // Prevent concurrent polls
-      if (this.isPolling) {
-        this.opts.logger?.debug("skipping poll - already polling");
-        recordTelemetryCounter(
-          this.opts.telemetry?.pollCounter,
-          this.opts.telemetry,
-          {
-            [TxOBTelemetryAttributeKey.PollOutcome]:
-              TxOBTelemetryPollOutcome.SkippedAlreadyPolling,
-          },
-        );
-        return;
-      }
-
-      this.isPolling = true;
-      const pollStartedAt = Date.now();
-      const pollSpan = startTelemetrySpan(
-        this.opts.telemetry,
-        TxOBTelemetrySpanName.Poll,
-        {
-          [TxOBTelemetryAttributeKey.QueueSize]: queuedEventIds.size,
-          [TxOBTelemetryAttributeKey.QueueMaxSize]: this.opts.maxQueuedEvents,
-        },
-      );
-      let pollOutcome: TxOBTelemetryPollOutcome =
-        TxOBTelemetryPollOutcome.Success;
-      let pollError: unknown;
-      try {
-        // Skip polling if we're at capacity to prevent memory leaks
-        if (queuedEventIds.size >= this.opts.maxQueuedEvents) {
-          pollOutcome = TxOBTelemetryPollOutcome.SkippedQueueFull;
-          this.opts.logger?.debug(
-            {
-              queuedCount: queuedEventIds.size,
-              maxQueuedEvents: this.opts.maxQueuedEvents,
-            },
-            "skipping poll - queue at capacity",
-          );
-          return;
-        }
-
-        const events = await this.client.getEventsToProcess({
-          ...this.opts,
-          signal: this.abortController.signal,
-        });
-
-        const unqueuedEvents = events.filter(
-          (event) => !queuedEventIds.has(event.id),
-        );
-        setTelemetrySpanAttributes(pollSpan, {
-          [TxOBTelemetryAttributeKey.EventsFound]: events.length,
-          [TxOBTelemetryAttributeKey.EventsQueued]: unqueuedEvents.length,
-          [TxOBTelemetryAttributeKey.QueueSize]: queuedEventIds.size,
-        });
-        this.opts.logger?.debug(
-          `found ${unqueuedEvents.length} events to process`,
-        );
-
-        for (const event of unqueuedEvents) {
-          queuedEventIds.add(event.id);
-          this.queue
-            .add(
-              async () => {
-                try {
-                  const { backoffUntil } = await processEvent<
-                    TxOBEventType,
-                    TEventDataMap
-                  >({
-                    client: this.client,
-                    handlerMap: this.handlerMap,
-                    unlockedEvent: event,
-                    opts: {
-                      ...this.opts,
-                      signal: this.abortController.signal,
-                    },
-                  });
-
-                  // Simulate a local wakeup signal after the backoff period
-                  // to reduce latency on backed-off event reprocessing
-                  if (backoffUntil) {
-                    sleep(
-                      backoffUntil.getTime() - Date.now(),
-                      this.abortController.signal,
-                    )
-                      .then(() => {
-                        this.throttledPoll?.();
-                      })
-                      .catch(() => {});
-                  }
-                } catch (error) {
-                  this.opts.logger?.error(
-                    {
-                      eventId: event.id,
-                      error,
-                    },
-                    "error processing event",
-                  );
-                } finally {
-                  queuedEventIds.delete(event.id);
-                }
-              },
-              { signal: this.abortController.signal },
-            )
-            .catch(() => {
-              // Handle queue.add() rejections (e.g., when aborted)
-              // The event processing error is already logged in the task's catch block
-              queuedEventIds.delete(event.id);
-            });
-        }
-      } catch (error) {
-        pollOutcome = TxOBTelemetryPollOutcome.Error;
-        pollError = error;
-        this.opts.logger?.error(
-          { error },
-          "error polling for events, will retry",
-        );
-        // Continue polling even on error
-      } finally {
-        recordTelemetryCounter(
-          this.opts.telemetry?.pollCounter,
-          this.opts.telemetry,
-          {
-            [TxOBTelemetryAttributeKey.PollOutcome]: pollOutcome,
-          },
-        );
-        recordTelemetryDuration(
-          this.opts.telemetry?.pollDuration,
-          this.opts.telemetry,
-          pollStartedAt,
-          {
-            [TxOBTelemetryAttributeKey.PollOutcome]: pollOutcome,
-          },
-        );
-        endTelemetrySpan(pollSpan, pollError);
-        this.isPolling = false;
-      }
-    };
-
-    if (this.wakeupEmitter) {
-      // Setup wakeup signal listener with combined leading and trailing edge throttle
-      // Using throttle-debounce library for robust throttling behavior
-      // Leading edge: Poll immediately on the first signal
-      // Trailing edge: If signals keep coming, also poll after a delay from the last signal
-      // This provides both low latency (leading edge) and ensures we catch events
-      // even if signals arrive in a continuous burst (trailing edge)
-      const throttleMs = this.opts.wakeupThrottleMs;
-
-      // Create throttled poll function with both leading and trailing edges
-      // noLeading: false (default) = execute immediately on first signal (leading edge)
-      // noTrailing: false (default) = also execute after delay from last signal (trailing edge)
-      // This throttled poll is used by both wakeup signals and fallback polling to prevent conflicts
-      this.throttledPoll = throttle(throttleMs, () => {
-        if (this.abortController.signal.aborted) {
-          return;
-        }
-        this.lastWakeupTime = Date.now();
-        this.opts.logger?.debug("triggering throttled poll");
-        void poll();
-      });
-
-      this.wakeupListener = () => {
-        if (this.abortController.signal.aborted) {
-          return;
-        }
-        this.opts.logger?.debug("received wakeup signal");
-        this.throttledPoll?.();
-      };
-
-      this.wakeupEmitter.on("wakeup", this.wakeupListener);
-      this.opts.logger?.debug("wakeup signal listener registered");
-
-      // Initial poll
-      this.throttledPoll?.();
-
-      // Start fallback polling loop
-      // This runs at a lower frequency and only polls if we haven't received a wakeup signal recently
-      // Uses the same throttled poll function to prevent conflicts with wakeup-triggered polls
-      (async () => {
-        try {
-          do {
-            await sleep(
-              this.opts.pollingIntervalMs,
-              this.abortController.signal,
-            ).catch(() => {});
-
-            if (this.abortController.signal.aborted) {
-              break;
-            }
-
-            // Check if we've received a wakeup signal recently
-            const timeSinceLastWakeup = Date.now() - this.lastWakeupTime;
-            if (timeSinceLastWakeup >= this.opts.wakeupTimeoutMs) {
-              this.opts.logger?.debug(
-                {
-                  timeSinceLastWakeup,
-                  wakeupTimeoutMs: this.opts.wakeupTimeoutMs,
-                },
-                "fallback poll triggered - no wakeup signal received",
-              );
-              this.throttledPoll?.();
-            } else {
-              this.opts.logger?.debug(
-                {
-                  timeSinceLastWakeup,
-                  wakeupTimeoutMs: this.opts.wakeupTimeoutMs,
-                },
-                "skipping fallback poll - wakeup signal received recently",
-              );
-            }
-          } while (!this.abortController.signal.aborted);
-        } catch (error) {
-          this.opts.logger?.error({ error }, "fallback polling loop error");
-        }
-      })();
-    } else {
-      // Standard polling loop
-      (async () => {
-        try {
-          do {
-            await poll();
-            await sleep(
-              this.opts.pollingIntervalMs,
-              this.abortController.signal,
-            ).catch(() => {});
-          } while (!this.abortController.signal.aborted);
-        } catch (error) {
-          this.opts.logger?.error({ error }, "polling loop error");
-        }
-      })();
+    this.throttledTick = throttle(this.opts.wakeupThrottleMs, () =>
+      this.requestTick(),
+    );
+    if (this.opts.wakeupEmitter) {
+      this.wakeupListener = () => this.throttledTick?.();
+      this.opts.wakeupEmitter.on("wakeup", this.wakeupListener);
     }
+
+    void (async () => {
+      while (!signal.aborted) {
+        this.requestTick();
+        await sleep(this.opts.pollingIntervalMs, signal).catch(() => {});
+      }
+    })();
+
+    this.opts.logger?.debug("processor started");
   }
 
   async stop(opts?: { timeoutMs?: number }): Promise<void> {
@@ -943,40 +348,47 @@ export class EventProcessor<
     }
     this.state = "stopping";
     this.opts.logger?.debug("processor stopping");
+    const timeoutMs = opts?.timeoutMs ?? 10_000;
 
-    const _stopOpts = {
-      timeoutMs: 10000,
-      ...opts,
-    };
-
-    // Clean up wakeup listener
-    if (this.wakeupListener && this.wakeupEmitter) {
-      this.wakeupEmitter.off("wakeup", this.wakeupListener);
+    if (this.wakeupListener) {
+      this.opts.wakeupEmitter?.off("wakeup", this.wakeupListener);
       this.wakeupListener = undefined;
     }
+    this.throttledTick?.cancel();
+    this.throttledTick = undefined;
+    for (const timer of this.timers) clearTimeout(timer);
+    this.timers.clear();
 
-    // Cancel throttled poll (cleans up any pending timers)
-    if (this.throttledPoll) {
-      (this.throttledPoll as { cancel?: () => void }).cancel?.();
-      this.throttledPoll = undefined;
-    }
-
-    this.abortController.abort();
-    this.queue.pause();
+    this.abortController.abort(new ProcessorStoppingError());
 
     let caughtErr: unknown;
+    const drained = (async () => {
+      // A poll in flight may still claim deliveries; let it finish (it releases them) first
+      await this.ticking;
+      if (this.active.size > 0) {
+        await new Promise<void>((resolve) => {
+          this.drained = resolve;
+        });
+      }
+    })();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`shutdown timeout ${timeoutMs}ms elapsed`)),
+        timeoutMs,
+      );
+    });
     try {
-      // Wait for both the queue to be empty and the polling loop to complete
-      await Promise.race([
-        this.queue.onPendingZero(),
-        sleep(_stopOpts.timeoutMs).then(() => {
-          throw new Error(`shutdown timeout ${_stopOpts.timeoutMs}ms elapsed`);
-        }),
-      ]);
+      await Promise.race([drained, timeout]);
     } catch (error) {
       caughtErr = error;
+    } finally {
+      clearTimeout(timer);
     }
 
+    clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    this.drained = undefined;
     this.state = "stopped";
     this.opts.logger?.debug("processor stopped");
 
@@ -985,28 +397,536 @@ export class EventProcessor<
       throw caughtErr;
     }
   }
+
+  /** Runs a tick now, or once the current tick finishes. */
+  private requestTick(): void {
+    if (this.state !== "started") return;
+    if (this.ticking) {
+      this.tickAgain = true;
+      return;
+    }
+    this.ticking = this.tick().finally(() => {
+      this.ticking = undefined;
+      if (this.tickAgain) {
+        this.tickAgain = false;
+        this.requestTick();
+      }
+    });
+  }
+
+  private async tick(): Promise<void> {
+    const signal = this.abortController.signal;
+    const startedAt = Date.now();
+    const span = startTelemetrySpan(
+      this.telemetry,
+      TxOBTelemetrySpanName.Poll,
+      {
+        [TxOBTelemetryAttributeKey.ActiveDeliveries]: this.active.size,
+      },
+    );
+    let outcome: (typeof TxOBTelemetryPollOutcome)[keyof typeof TxOBTelemetryPollOutcome] =
+      TxOBTelemetryPollOutcome.Success;
+    let error: unknown;
+    try {
+      let fanoutFull = false;
+      try {
+        fanoutFull = await this.fanout(signal, span);
+      } catch (err) {
+        if (signal.aborted) return;
+        // Deliveries already fanned out can still run
+        outcome = TxOBTelemetryPollOutcome.Error;
+        error = err;
+        this.opts.logger?.error({ error: err }, "error fanning out events");
+      }
+      if (signal.aborted) return;
+      await this.claimDeliveries(signal, span);
+      if (fanoutFull) this.tickAgain = true;
+    } catch (err) {
+      if (signal.aborted) return;
+      outcome = TxOBTelemetryPollOutcome.Error;
+      error = err;
+      this.opts.logger?.error({ error: err }, "error polling, will retry");
+    } finally {
+      const attributes = { [TxOBTelemetryAttributeKey.PollOutcome]: outcome };
+      recordTelemetryCounter(
+        this.telemetry.pollCounter,
+        this.telemetry,
+        attributes,
+      );
+      recordTelemetryDuration(
+        this.telemetry.pollDuration,
+        this.telemetry,
+        startedAt,
+        attributes,
+      );
+      endTelemetrySpan(span, error);
+    }
+  }
+
+  /** Returns true if the batch was full and more events may be waiting. */
+  private async fanout(
+    signal: AbortSignal,
+    span: ReturnType<typeof startTelemetrySpan>,
+  ): Promise<boolean> {
+    const events = await this.store.claimEventsForFanout({
+      types: [...this.handlers.keys()],
+      limit: this.opts.fanoutBatchSize,
+      leaseMs: this.opts.leaseMs,
+      signal,
+    });
+    if (events.length === 0) return false;
+
+    const eventIds: string[] = [];
+    const deliveries: TxOBNewDelivery[] = [];
+    for (const event of events) {
+      try {
+        const eventDeliveries = (this.handlers.get(event.type) ?? []).map(
+          (handler): TxOBNewDelivery => {
+            const priority = handler.priority(event);
+            if (
+              !Number.isInteger(priority) ||
+              Math.abs(priority) > maxPriority
+            ) {
+              throw new Error(
+                `${event.type}.${handler.name}: priority must be a 32-bit integer, got ${priority}`,
+              );
+            }
+            const key = handler.perKey ? handler.perKey.key(event) : null;
+            if (key !== null && typeof key !== "string") {
+              throw new Error(
+                `${event.type}.${handler.name}: concurrency key must be a string or null, got ${typeof key}`,
+              );
+            }
+            return {
+              event_id: event.id,
+              event_type: event.type,
+              handler: handler.name,
+              priority,
+              concurrency_key: key,
+            };
+          },
+        );
+        eventIds.push(event.id);
+        deliveries.push(...eventDeliveries);
+      } catch (error) {
+        // Left unfanned; it is retried when its lease expires. Other events in the batch
+        // are unaffected.
+        this.opts.logger?.error(
+          {
+            eventId: event.id,
+            type: event.type,
+            fanoutAttempts: event.fanout_attempts,
+            error,
+          },
+          "error computing deliveries for event (invalid priority or concurrency key)",
+        );
+      }
+    }
+
+    if (eventIds.length > 0) {
+      await this.store.completeFanout({
+        event_ids: eventIds,
+        deliveries,
+        signal,
+      });
+      recordTelemetryCounter(
+        this.telemetry.fanoutCounter,
+        this.telemetry,
+        {},
+        eventIds.length,
+      );
+    }
+    setTelemetrySpanAttributes(span, {
+      [TxOBTelemetryAttributeKey.EventsFannedOut]: eventIds.length,
+    });
+    this.opts.logger?.debug(
+      { events: eventIds.length, deliveries: deliveries.length },
+      "fanned out events",
+    );
+    return events.length >= this.opts.fanoutBatchSize;
+  }
+
+  private async claimDeliveries(
+    signal: AbortSignal,
+    span: ReturnType<typeof startTelemetrySpan>,
+  ): Promise<void> {
+    const free = this.opts.concurrency - this.active.size;
+    if (free <= 0) {
+      this.backlog = true;
+      return;
+    }
+
+    const slots = [...this.handlersByKey.values()].map(
+      (handler): TxOBHandlerSlot => ({
+        event_type: handler.eventType,
+        handler: handler.name,
+        limit: free,
+        concurrency: handler.concurrency,
+        concurrencyPerKey: handler.perKey?.limit,
+        rateLimit: handler.rateLimit,
+      }),
+    );
+
+    const claimedAt = Date.now();
+    const deliveries = await this.store.claimDeliveries({
+      slots,
+      limit: free,
+      leaseMs: this.opts.leaseMs,
+      signal,
+    });
+    setTelemetrySpanAttributes(span, {
+      [TxOBTelemetryAttributeKey.DeliveriesClaimed]: deliveries.length,
+    });
+    if (signal.aborted) {
+      // Stopped while claiming: hand the deliveries straight back
+      await this.store.releaseDeliveries(deliveries);
+      return;
+    }
+    // A full claim means more may be waiting; claim again as capacity frees up
+    this.backlog = deliveries.length >= free;
+
+    for (const delivery of deliveries) {
+      const handlerKey = `${delivery.event_type}:${delivery.handler}`;
+      const handler = this.handlersByKey.get(handlerKey);
+      if (!handler) {
+        // Store returned a delivery outside of the requested slots
+        this.opts.logger?.warn(
+          { delivery: deliveryKey(delivery) },
+          "unexpected delivery claimed",
+        );
+        continue;
+      }
+      // Reclaiming a delivery this processor still runs means the old lease lapsed
+      for (const previous of this.active.values()) {
+        if (
+          deliveryKey(previous.delivery) === deliveryKey(delivery) &&
+          !previous.leaseLost
+        ) {
+          this.loseLease(previous);
+        }
+      }
+      const active: ActiveDelivery = {
+        delivery,
+        handler,
+        controller: new AbortController(),
+        leaseLost: false,
+        leaseExpiresAt: claimedAt + this.opts.leaseMs,
+      };
+      this.active.set(activeKey(delivery), active);
+      void this.runDelivery(active).finally(() => {
+        this.active.delete(activeKey(delivery));
+        // Finishing frees capacity, and for a limited handler it can unblock queued work
+        const limited =
+          handler.concurrency !== undefined || handler.perKey !== undefined;
+        if (this.state === "started" && (this.backlog || limited)) {
+          this.requestTick();
+        }
+        if (this.active.size === 0) {
+          this.drained?.();
+        }
+      });
+    }
+  }
+
+  private async runDelivery(active: ActiveDelivery): Promise<void> {
+    const { delivery } = active;
+    await this.executeDelivery(active, {
+      eventId: delivery.event_id,
+      type: delivery.event_type,
+      handler: delivery.handler,
+      attempt: delivery.attempts,
+      correlationId: delivery.event.correlation_id,
+    });
+  }
+
+  private async executeDelivery(
+    active: ActiveDelivery,
+    logContext: Record<string, unknown>,
+  ): Promise<void> {
+    const { delivery, handler } = active;
+    const startedAt = Date.now();
+    const span = startTelemetrySpan(
+      this.telemetry,
+      TxOBTelemetrySpanName.DeliveryProcess,
+      {
+        [TxOBTelemetryAttributeKey.EventId]: delivery.event_id,
+        [TxOBTelemetryAttributeKey.EventType]: delivery.event_type,
+        [TxOBTelemetryAttributeKey.EventCorrelationId]:
+          delivery.event.correlation_id ?? "",
+        [TxOBTelemetryAttributeKey.HandlerName]: delivery.handler,
+        [TxOBTelemetryAttributeKey.DeliveryAttempt]: delivery.attempts,
+      },
+    );
+
+    let handlerError: unknown;
+    let event: TxOBEventFromSchemas<TEventSchemas> | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      if (delivery.attempts > handler.maxAttempts) {
+        // Previous attempts lost their lease (e.g. the processor crashed mid-handler)
+        throw new ErrorUnprocessableEventHandler(
+          new Error(`max attempts (${handler.maxAttempts}) exceeded`),
+        );
+      }
+
+      // Re-validate so handlers receive the schema's output type (e.g. coerced dates)
+      const schema = this.eventSchemas[delivery.event_type];
+      try {
+        event = {
+          ...delivery.event,
+          data: await validateEventData(
+            delivery.event_type,
+            schema,
+            delivery.event.data,
+          ),
+        } as TxOBEventFromSchemas<TEventSchemas>;
+      } catch (error) {
+        throw error instanceof TxOBValidationError
+          ? new ErrorUnprocessableEventHandler(error)
+          : error;
+      }
+
+      const signals = [this.abortController.signal, active.controller.signal];
+      if (handler.timeoutMs !== undefined) {
+        // Cancels the handler's context; the handler decides how to wind down and its own
+        // result (resolve or throw) determines the outcome
+        const timeoutController = new AbortController();
+        signals.push(timeoutController.signal);
+        const timeoutMs = handler.timeoutMs;
+        timer = setTimeout(
+          () => timeoutController.abort(new TxOBTimeoutError(timeoutMs)),
+          timeoutMs,
+        );
+      }
+
+      await handler.fn(event, {
+        signal: AbortSignal.any(signals),
+        attempt: delivery.attempts,
+        handler: delivery.handler,
+      });
+    } catch (error) {
+      handlerError = error;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    let outcome: (typeof TxOBTelemetryDeliveryOutcome)[keyof typeof TxOBTelemetryDeliveryOutcome];
+    try {
+      outcome = await this.finalizeDelivery(
+        active,
+        event,
+        handlerError,
+        logContext,
+      );
+    } catch (error) {
+      // The lease will expire and the delivery will be retried
+      outcome = TxOBTelemetryDeliveryOutcome.Retry;
+      this.opts.logger?.error(
+        { ...logContext, error },
+        "error recording delivery result",
+      );
+    }
+
+    this.recordDelivery(delivery, outcome, startedAt);
+    setTelemetrySpanAttributes(span, {
+      [TxOBTelemetryAttributeKey.DeliveryOutcome]: outcome,
+    });
+    endTelemetrySpan(span, handlerError);
+  }
+
+  private async finalizeDelivery(
+    active: ActiveDelivery,
+    event: TxOBEventFromSchemas<TEventSchemas> | undefined,
+    handlerError: unknown,
+    logContext: Record<string, unknown>,
+  ): Promise<
+    (typeof TxOBTelemetryDeliveryOutcome)[keyof typeof TxOBTelemetryDeliveryOutcome]
+  > {
+    const { delivery, handler } = active;
+
+    if (active.leaseLost) {
+      this.opts.logger?.warn(
+        logContext,
+        "delivery lease lost; result discarded",
+      );
+      return TxOBTelemetryDeliveryOutcome.LeaseLost;
+    }
+
+    if (handlerError !== undefined && this.abortController.signal.aborted) {
+      // Failed while shutting down, most likely because the handler honored the abort signal.
+      // Give the delivery back without counting the attempt.
+      await this.store.releaseDeliveries([delivery]);
+      this.opts.logger?.debug(logContext, "delivery released on shutdown");
+      return TxOBTelemetryDeliveryOutcome.Released;
+    }
+
+    if (handlerError === undefined) {
+      const ok = await this.store.completeDelivery(delivery);
+      if (!ok) {
+        this.opts.logger?.warn(
+          logContext,
+          "delivery lease lost before completion",
+        );
+        return TxOBTelemetryDeliveryOutcome.LeaseLost;
+      }
+      this.opts.logger?.debug(logContext, "handler succeeded");
+      return TxOBTelemetryDeliveryOutcome.Success;
+    }
+
+    const dead =
+      handlerError instanceof ErrorUnprocessableEventHandler ||
+      delivery.attempts >= handler.maxAttempts;
+    this.opts.logger?.error(
+      { ...logContext, error: handlerError },
+      dead ? "handler failed; delivery dead" : "handler failed; will retry",
+    );
+
+    if (dead) {
+      const onDeliveryDead = this.opts.onDeliveryDead;
+      const ok = await this.store.failDelivery(
+        delivery,
+        { error: serializeError(handlerError), run_after: null },
+        {
+          within: onDeliveryDead
+            ? (tx) =>
+                onDeliveryDead({
+                  event:
+                    event ??
+                    (delivery.event as TxOBEventFromSchemas<TEventSchemas>),
+                  handler: delivery.handler,
+                  attempts: delivery.attempts,
+                  error: handlerError,
+                  tx,
+                  publish: (type, data, opts) =>
+                    this.publish(tx, type, data, opts),
+                })
+            : undefined,
+        },
+      );
+      return ok
+        ? TxOBTelemetryDeliveryOutcome.Dead
+        : TxOBTelemetryDeliveryOutcome.LeaseLost;
+    }
+
+    const backoff = handler.backoff({
+      attempt: delivery.attempts,
+      error: handlerError,
+      event: event ?? delivery.event,
+      handler: delivery.handler,
+    });
+    let runAfter =
+      backoff instanceof Date ? backoff : new Date(Date.now() + backoff);
+    if (
+      handlerError instanceof TxOBError &&
+      handlerError.backoffUntil &&
+      handlerError.backoffUntil > runAfter
+    ) {
+      runAfter = handlerError.backoffUntil;
+    }
+
+    const ok = await this.store.failDelivery(delivery, {
+      error: serializeError(handlerError),
+      run_after: runAfter,
+    });
+    if (ok) this.scheduleTick(runAfter);
+    return ok
+      ? TxOBTelemetryDeliveryOutcome.Retry
+      : TxOBTelemetryDeliveryOutcome.LeaseLost;
+  }
+
+  /** Poll when a backed-off delivery becomes due instead of waiting for the next interval. */
+  private scheduleTick(at: Date): void {
+    if (this.state !== "started") return;
+    const timer = setTimeout(
+      () => {
+        this.timers.delete(timer);
+        this.requestTick();
+      },
+      Math.max(at.getTime() - Date.now(), 0),
+    );
+    timer.unref?.();
+    this.timers.add(timer);
+  }
+
+  private loseLease(active: ActiveDelivery): void {
+    active.leaseLost = true;
+    active.controller.abort(new LeaseLostError());
+    this.opts.logger?.warn(
+      { eventId: active.delivery.event_id, handler: active.delivery.handler },
+      "delivery lease lost",
+    );
+  }
+
+  private async extendLeases(): Promise<void> {
+    // A lease that couldn't be renewed in time may already belong to another processor
+    for (const active of this.active.values()) {
+      if (!active.leaseLost && Date.now() >= active.leaseExpiresAt) {
+        this.loseLease(active);
+      }
+    }
+    const actives = [...this.active.values()].filter((a) => !a.leaseLost);
+    if (actives.length === 0) return;
+    const renewedAt = Date.now();
+    try {
+      const lost = await this.store.extendLeases(
+        actives.map((a) => a.delivery),
+        { leaseMs: this.opts.leaseMs },
+      );
+      for (const delivery of lost) {
+        const active = this.active.get(activeKey(delivery));
+        if (active && !active.leaseLost) this.loseLease(active);
+      }
+      for (const active of actives) {
+        active.leaseExpiresAt = renewedAt + this.opts.leaseMs;
+      }
+    } catch (error) {
+      this.opts.logger?.error({ error }, "error extending delivery leases");
+    }
+  }
+
+  private recordDelivery(
+    delivery: TxOBDelivery,
+    outcome: (typeof TxOBTelemetryDeliveryOutcome)[keyof typeof TxOBTelemetryDeliveryOutcome],
+    startedAt?: number,
+  ): void {
+    const attributes = {
+      [TxOBTelemetryAttributeKey.EventType]: delivery.event_type,
+      [TxOBTelemetryAttributeKey.HandlerName]: delivery.handler,
+      [TxOBTelemetryAttributeKey.DeliveryOutcome]: outcome,
+    };
+    recordTelemetryCounter(
+      this.telemetry.deliveryCounter,
+      this.telemetry,
+      attributes,
+    );
+    if (startedAt !== undefined) {
+      recordTelemetryDuration(
+        this.telemetry.deliveryDuration,
+        this.telemetry,
+        startedAt,
+        attributes,
+      );
+    }
+  }
 }
 
 export const createEventProcessor = <
-  const TEventSchemas extends TxOBEventSchemaMap<string>,
+  const TEventSchemas extends TxOBEventSchemaMap,
+  TTx,
+  const THandlerMap extends TxOBHandlerMap<TEventSchemas> =
+    TxOBHandlerMap<TEventSchemas>,
 >(
-  opts: CreateEventProcessorOptsFromSchemas<TEventSchemas>,
-): EventProcessor<
-  TxOBEventTypeFromSchemas<TEventSchemas>,
-  TxOBEventDataMapFromSchemas<TEventSchemas>
-> => {
-  const { eventSchemas: _eventSchemas, ...processorOpts } = opts;
-  return new EventProcessor(processorOpts);
-};
+  opts: CreateEventProcessorOpts<TEventSchemas, TTx, THandlerMap>,
+): EventProcessor<TEventSchemas, TTx, THandlerMap> => new EventProcessor(opts);
 
+/**
+ * Identity helper that types a handler map against event schemas, for defining handlers
+ * separately from the processor.
+ */
 export const createEventHandlerMap = <
-  const TEventSchemas extends TxOBEventSchemaMap<string>,
->(
-  opts: {
-    eventSchemas: TEventSchemas;
-    handlerMap: TxOBEventHandlerMapFromSchemas<TEventSchemas>;
-  },
-): TxOBEventHandlerMapFromSchemas<TEventSchemas> => {
-  const { eventSchemas: _eventSchemas, handlerMap } = opts;
-  return handlerMap;
-};
+  const TEventSchemas extends TxOBEventSchemaMap,
+  const THandlerMap extends TxOBHandlerMap<TEventSchemas>,
+>(opts: {
+  eventSchemas: TEventSchemas;
+  handlerMap: THandlerMap;
+}): THandlerMap => opts.handlerMap;
