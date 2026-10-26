@@ -177,7 +177,7 @@
     "ts-node": "^10.9.2",
     "typeorm": "^1.1.2",
     "typescript": "^6.0.3",
-    "vitest": "^4.0.15"
+    "vitest": "^5.0.5"
   },
   "resolutions": {
     "copyfiles/minimatch": "3.1.5",
