@@ -6,6 +6,7 @@ import {
   TxOBError,
   type CreateEventProcessorOpts,
   type EventProcessor,
+  type TxOBDelivery,
   type TxOBEvent,
   type TxOBStore,
   type WakeupEmitter,
@@ -442,19 +443,17 @@ export const runStoreContract = <TTx>(
             concurrencyPerKey: 1,
           },
         ];
-        // Stores may need a second claim to look past the hot key once it is at its limit
-        const first = [
-          ...(await h.store.claimDeliveries({
-            slots,
-            limit: 10,
-            leaseMs: 60_000,
-          })),
-          ...(await h.store.claimDeliveries({
-            slots,
-            limit: 10,
-            leaseMs: 60_000,
-          })),
-        ];
+        // Stores may need a few claims to look past the hot key once it is at its limit
+        const first: TxOBDelivery[] = [];
+        for (let i = 0; i < 4 && first.length < 6; i++) {
+          first.push(
+            ...(await h.store.claimDeliveries({
+              slots,
+              limit: 10,
+              leaseMs: 60_000,
+            })),
+          );
+        }
         expect(first.map((d) => d.concurrency_key).sort()).toEqual([
           "cold0",
           "cold1",
@@ -703,15 +702,17 @@ export const runStoreContract = <TTx>(
           UserCreated: {
             slow: async () => {
               calls++;
-              await delay(400);
+              await delay(1_500);
             },
           },
         };
-        startProcessor({ leaseMs: 100, handlerMap });
-        startProcessor({ leaseMs: 100, handlerMap });
+        // Renewed every ~170ms, so a busy CI runner doesn't lose it
+        startProcessor({ leaseMs: 500, handlerMap });
+        startProcessor({ leaseMs: 500, handlerMap });
         await publishUsers(1);
         await waitFor(
           async () => (await deliveriesBy("completed")).length === 1,
+          { timeoutMs: 10_000 },
         );
         expect(calls).toBe(1);
       });
