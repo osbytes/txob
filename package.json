@@ -1,6 +1,6 @@
 {
   "name": "txob",
-  "description": "transactional outbox event processor with graceful shutdown and horizontal scalability",
+  "description": "transactional outbox with typed events, per-handler deliveries, and concurrency controls for Postgres, MongoDB, Redis and DynamoDB",
   "keywords": [
     "outbox pattern",
     "transactional outbox",
@@ -10,7 +10,12 @@
     "graceful shutdown",
     "horizontal scalability",
     "at-least-once",
-    "at-least-once delivery"
+    "at-least-once delivery",
+    "redis",
+    "valkey",
+    "dynamodb",
+    "mongodb",
+    "postgres"
   ],
   "author": "Dillon Streator <dillonstreator@gmail.com>",
   "homepage": "https://github.com/osbytes/txob",
@@ -18,7 +23,7 @@
     "type": "git",
     "url": "git://github.com/osbytes/txob.git"
   },
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "license": "MIT",
   "files": [
@@ -34,19 +39,34 @@
       "require": "./dist/cjs/index.js"
     },
     "./pg": {
-      "types": "./dist/pg/client.d.ts",
-      "import": "./dist/pg/client.js",
-      "require": "./dist/cjs/pg/client.js"
+      "types": "./dist/pg/index.d.ts",
+      "import": "./dist/pg/index.js",
+      "require": "./dist/cjs/pg/index.js"
     },
     "./mongodb": {
-      "types": "./dist/mongodb/client.d.ts",
-      "import": "./dist/mongodb/client.js",
-      "require": "./dist/cjs/mongodb/client.js"
+      "types": "./dist/mongodb/index.d.ts",
+      "import": "./dist/mongodb/index.js",
+      "require": "./dist/cjs/mongodb/index.js"
+    },
+    "./redis": {
+      "types": "./dist/redis/index.d.ts",
+      "import": "./dist/redis/index.js",
+      "require": "./dist/cjs/redis/index.js"
+    },
+    "./dynamodb": {
+      "types": "./dist/dynamodb/index.d.ts",
+      "import": "./dist/dynamodb/index.js",
+      "require": "./dist/cjs/dynamodb/index.js"
+    },
+    "./memory": {
+      "types": "./dist/memory/index.d.ts",
+      "import": "./dist/memory/index.js",
+      "require": "./dist/cjs/memory/index.js"
     },
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "npm-run-all clean build:esm build:cjs copy:files",
+    "build": "npm-run-all clean build:esm build:cjs copy:files mark:cjs",
     "build:esm": "tsc --build",
     "build:cjs": "tsc --build tsconfig.cjs.json",
     "copy:files": "copyfiles package.json README.md LICENSE dist",
@@ -55,30 +75,41 @@
     "nuke": "rimraf node_modules dist",
     "test": "vitest",
     "test:ci": "yarn test --run --coverage",
-    "format": "prettier -w ."
+    "format": "prettier -w .",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "mark:cjs": "node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({ type: 'commonjs' }))\""
   },
   "dependencies": {
     "@standard-schema/spec": "^1.1.0",
-    "p-limit": "^7.2.0",
-    "p-queue": "^9.0.1",
     "throttle-debounce": "^5.0.2"
   },
   "peerDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@aws-sdk/util-dynamodb": "^3.0.0",
     "mongodb": "^7.0.0",
     "pg": "^8.0.0"
   },
   "devDependencies": {
-    "@types/mongodb": "^4.0.7",
+    "@aws-sdk/client-dynamodb": "^3",
+    "@aws-sdk/lib-dynamodb": "^3",
+    "@aws-sdk/util-dynamodb": "^3",
     "@types/node": "^25.0.3",
     "@types/pg": "^8.10.9",
     "@types/throttle-debounce": "^5.0.2",
     "@vitest/coverage-v8": "^4.0.15",
     "copyfiles": "^2.4.1",
+    "dynamodb-toolbox": "^2.11.1",
+    "dynamoose": "^4.2.0",
+    "electrodb": "^3.9.3",
+    "ioredis": "^6",
+    "iovalkey": "^0.4.0",
     "mongodb": "^7.0.0",
     "nodemon": "^3.0.2",
     "npm-run-all": "^4.1.5",
     "pg": "^8.0.0",
     "prettier": "^3.1.1",
+    "redis": "^6",
     "rimraf": "^6.0.1",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3",
@@ -98,5 +129,25 @@
     "npm-run-all/minimatch/brace-expansion": "1.1.14",
     "ts-node/diff": "4.0.4"
   },
-  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e",
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-dynamodb": {
+      "optional": true
+    },
+    "@aws-sdk/lib-dynamodb": {
+      "optional": true
+    },
+    "@aws-sdk/util-dynamodb": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.3"
+  }
 }
