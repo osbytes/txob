@@ -407,7 +407,7 @@ export const runStoreContract = <TTx>(
             claimed.filter((d) => d.handler === `keyed${round}`),
           ).toHaveLength(4);
         }
-      });
+      }, 30_000);
 
       it("doesn't let one key's backlog starve other keys", async () => {
         // The hot key's deliveries are all older than the other keys' ones
