@@ -971,7 +971,8 @@ export const runStoreContract = <TTx>(
               concurrency: 2,
               handler: async () => {
                 maxRunning = Math.max(maxRunning, ++running);
-                await delay(15);
+                // Long enough to overlap even when claims are slow (DynamoDB Local on CI)
+                await delay(100);
                 running--;
               },
             },
