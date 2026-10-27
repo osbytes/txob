@@ -12,7 +12,7 @@
   "dependencies": {
     "http-graceful-shutdown": "^3.1.13",
     "pg": "^8.11.3",
-    "zod": "^4.1.12"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
