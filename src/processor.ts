@@ -482,12 +482,9 @@ export class EventProcessor<
     let firstDue: Date | null = null;
     for (const event of events) {
       try {
-        // Stores hand `defer` back as plain JSON; revive `until` and reject corrupt values
-        const eventDefer = normalizeDefer(event.defer, `${event.type}.defer`);
-        const revived = { ...event, defer: eventDefer };
         const eventDeliveries = (this.handlers.get(event.type) ?? []).map(
           (handler): TxOBNewDelivery => {
-            const priority = handler.priority(revived);
+            const priority = handler.priority(event);
             if (
               !Number.isInteger(priority) ||
               Math.abs(priority) > maxPriority
@@ -496,18 +493,22 @@ export class EventProcessor<
                 `${event.type}.${handler.name}: priority must be a 32-bit integer, got ${priority}`,
               );
             }
-            const key = handler.perKey ? handler.perKey.key(revived) : null;
+            const key = handler.perKey ? handler.perKey.key(event) : null;
             if (key !== null && typeof key !== "string") {
               throw new Error(
                 `${event.type}.${handler.name}: concurrency key must be a string or null, got ${typeof key}`,
               );
             }
             // The publisher's request wins over the handler's default
-            const path = `${event.type}.${handler.name}`;
-            const defer =
-              eventDefer ??
-              normalizeDefer(handler.defer(revived), `${path}.defer`);
-            const run_after = resolveDefer(defer, event);
+            const run_after =
+              event.defer_until ??
+              resolveDefer(
+                normalizeDefer(
+                  handler.defer(event),
+                  `${event.type}.${handler.name}.defer`,
+                ),
+                event,
+              );
             if (
               run_after !== null &&
               (firstDue === null || run_after < firstDue)

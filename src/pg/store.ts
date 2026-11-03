@@ -91,7 +91,7 @@ type DeliveryRow = {
   data: TxOBEvent["data"];
   correlation_id: string | null;
   event_created_at: Date;
-  defer: TxOBEvent["defer"];
+  defer_until: Date | null;
 };
 
 const toDelivery = (row: DeliveryRow): TxOBDelivery => ({
@@ -108,7 +108,7 @@ const toDelivery = (row: DeliveryRow): TxOBDelivery => ({
     data: toJson(row.data),
     correlation_id: row.correlation_id,
     created_at: toDate(row.event_created_at),
-    defer: toJson(row.defer) ?? null,
+    defer_until: row.defer_until === null ? null : toDate(row.defer_until),
   },
 });
 
@@ -221,7 +221,7 @@ WITH slots AS (
   WHERE s.rate_max IS NOT NULL AND r.event_type = s.event_type AND r.handler = s.handler
     AND r.claimed_at <= now() - ${ms("s.rate_ms")}
 )
-SELECT claimed.*, e.type, e.data, e.correlation_id, e.created_at AS event_created_at, e.defer
+SELECT claimed.*, e.type, e.data, e.correlation_id, e.created_at AS event_created_at, e.defer_until
 FROM claimed JOIN ${events} e ON e.id = claimed.event_id
 ORDER BY claimed.priority DESC`;
 
@@ -239,7 +239,7 @@ RETURNING 1`;
     insertEvent: async (tx, event) => {
       await db.queryIn(
         tx,
-        `INSERT INTO ${events} (id, type, data, correlation_id, created_at, defer) VALUES ($1, $2, $3::text::jsonb, $4, $5, $6::text::jsonb)`,
+        `INSERT INTO ${events} (id, type, data, correlation_id, created_at, defer_until) VALUES ($1, $2, $3::text::jsonb, $4, $5, $6)`,
         [
           event.id,
           event.type,
@@ -247,7 +247,7 @@ RETURNING 1`;
           event.correlation_id,
           // ISO strings: some drivers (e.g. Drizzle on postgres.js) don't encode Dates
           event.created_at.toISOString(),
-          event.defer === null ? null : JSON.stringify(event.defer),
+          event.defer_until?.toISOString() ?? null,
         ],
       );
     },
@@ -267,14 +267,14 @@ FROM (
   FOR UPDATE SKIP LOCKED
 ) claimable
 WHERE e.id = claimable.id
-RETURNING e.id, e.type, e.data, e.correlation_id, e.created_at, e.defer, e.fanout_attempts, e.fanout_lease_token`,
+RETURNING e.id, e.type, e.data, e.correlation_id, e.created_at, e.defer_until, e.fanout_attempts, e.fanout_lease_token`,
         [types, limit, leaseMs],
       );
       return rows.map((row) => ({
         ...row,
         data: toJson(row.data),
         created_at: toDate(row.created_at),
-        defer: toJson(row.defer) ?? null,
+        defer_until: row.defer_until === null ? null : toDate(row.defer_until),
       })) as TxOBFanoutEvent[];
     },
 

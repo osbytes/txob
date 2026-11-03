@@ -971,7 +971,7 @@ export const runStoreContract = <TTx>(
             data: { userId: 42 },
             correlation_id: null,
             created_at: new Date(),
-            defer: null,
+            defer_until: null,
           }),
         );
         await waitFor(async () => (await deliveriesBy("dead")).length === 1);
@@ -1151,11 +1151,15 @@ export const runStoreContract = <TTx>(
       });
 
       it("defers deliveries, with the publish-time defer overriding the handler's", async () => {
-        const ran: Record<string, { at: number; defer: unknown }[]> = {};
+        const ran: Record<string, { at: number; defer_until: Date | null }[]> =
+          {};
         const record =
           (name: string) =>
           async (event: TxOBEvent): Promise<void> => {
-            (ran[name] ??= []).push({ at: Date.now(), defer: event.defer });
+            (ran[name] ??= []).push({
+              at: Date.now(),
+              defer_until: event.defer_until,
+            });
           };
         startProcessor({
           handlerMap: {
@@ -1184,14 +1188,14 @@ export const runStoreContract = <TTx>(
         // Only plain.delayed is still waiting
         expect(ran.immediate).toHaveLength(2);
         expect(ran.delayed).toHaveLength(1);
-        expect(ran.delayed[0].defer).toEqual({ delayMs: 0 });
+        expect(ran.delayed[0].defer_until).toEqual(rushed.created_at);
         await waitFor(
           async () => (await deliveriesBy("completed")).length === 4,
           { timeoutMs: 5_000 },
         );
         expect(ran.delayed).toHaveLength(2);
         expect(ran.delayed[1].at - publishedAt).toBeGreaterThanOrEqual(490);
-        expect(ran.delayed[1].defer).toBeNull();
+        expect(ran.delayed[1].defer_until).toBeNull();
         expect((await h.getEvents()).map((e) => e.id).sort()).toEqual(
           [plain.id, rushed.id].sort(),
         );

@@ -108,7 +108,7 @@ export const createMemoryStore = (): MemoryStore => {
         data: event.data,
         correlation_id: event.correlation_id,
         created_at: event.created_at,
-        defer: event.defer,
+        defer_until: event.defer_until,
       }),
     };
   };
@@ -135,7 +135,7 @@ export const createMemoryStore = (): MemoryStore => {
           data,
           correlation_id,
           created_at,
-          defer,
+          defer_until,
           fanned_out_at,
         }) =>
           structuredClone({
@@ -144,7 +144,7 @@ export const createMemoryStore = (): MemoryStore => {
             data,
             correlation_id,
             created_at,
-            defer,
+            defer_until,
             fanned_out_at,
           }),
       ),
@@ -174,7 +174,7 @@ export const createMemoryStore = (): MemoryStore => {
           data: e.data,
           correlation_id: e.correlation_id,
           created_at: e.created_at,
-          defer: e.defer,
+          defer_until: e.defer_until,
           fanout_attempts: e.fanout_attempts,
           fanout_lease_token: e.fanout_lease_token,
         });

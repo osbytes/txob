@@ -340,10 +340,10 @@ describe("EventProcessor with a faulty store", () => {
       E: {
         fixed: { defer: { delayMs: 60_000 }, handler: async () => {} },
         fromEvent: {
-          defer: (event) => (event.defer ? null : { delayMs: 30_000 }),
+          defer: (event) => (event.defer_until ? null : { delayMs: 30_000 }),
           handler: async () => {},
         },
-        none: async (event) => void seen.push(event.defer),
+        none: async (event) => void seen.push(event.defer_until),
       },
     });
     const outbox = createOutbox({ eventSchemas, store: base });
@@ -378,9 +378,11 @@ describe("EventProcessor with a faulty store", () => {
       );
       expect(runAfter(absolute.id, handler)).toBe(until.getTime());
     }
-    expect(base.getEvents().find((e) => e.id === absolute.id)?.defer).toEqual({
-      until,
-    });
+    expect(
+      base.getEvents().find((e) => e.id === absolute.id)?.defer_until,
+    ).toEqual(until);
+    // Only the undeferred event ran before stop
+    expect(seen).toEqual([null]);
   });
 
   it("runs a deferred delivery when it becomes due, ahead of the next poll", async () => {

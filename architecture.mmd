@@ -8,7 +8,7 @@ graph TB
     end
 
     subgraph Database["Store (Postgres, MongoDB, Redis, DynamoDB, ...)"]
-        Events[("txob_events<br/>id, type, data, correlation_id, defer<br/>fanned_out_at, fanout lease")]
+        Events[("txob_events<br/>id, type, data, correlation_id, defer_until<br/>fanned_out_at, fanout lease")]
         Deliveries[("txob_deliveries<br/>one per (event, handler)<br/>status, attempts, priority,<br/>concurrency_key, run_after,<br/>lease_token, last_error")]
         Notify["Wakeup source<br/>pg_notify, change stream, pub/sub"]
     end

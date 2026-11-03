@@ -269,8 +269,8 @@ OrderPlaced: {
 await outbox.publish(tx, "OrderPlaced", data, { defer: { delayMs: 600_000 } });
 ```
 
-- **Resolved at fan-out.** The processor turns `defer` into the delivery's `run_after` when it creates the delivery, so a change to a handler's `defer` applies to events fanned out afterwards. `delayMs` counts from `created_at`, not from fan-out, so a processor that was down for an hour doesn't push "in 5 minutes" to "in 65 minutes", and repeated fan-outs of the same event agree.
-- **The publish-time `defer` wins** over the handler's for every handler of that event. The event's `defer` is also available to handler `defer` functions and handlers as `event.defer`, so a handler can opt out of honoring it.
+- **Resolved once, to a timestamp.** `publish` resolves its `defer` immediately and stores it on the event as `defer_until`. The processor resolves a handler's `defer` at fan-out, so a change to it applies to events fanned out afterwards. Either way the result is the delivery's `run_after`. `delayMs` counts from `created_at`, not from fan-out, so a processor that was down for an hour doesn't push "in 5 minutes" to "in 65 minutes", and repeated fan-outs of the same event agree.
+- **The publish-time `defer` wins** over the handler's for every handler of that event. The resolved time is available to handler `defer` functions and handlers as `event.defer_until`, so a handler can opt out of honoring it.
 - **Due deliveries are picked up promptly.** The processor that fanned the event out polls when the earliest deferred delivery is due; beyond `pollingIntervalMs`, the regular poll finds it.
 - **Priority still applies.** A deferred delivery competes with everything else that is due once its time comes.
 
@@ -652,7 +652,7 @@ A store implements `TxOBStore<TTx>`, where `TTx` is whatever handle your writes 
 
 1. **An atomic write with business data**, for `insertEvent`. Without this you don't have an outbox.
 2. **Compare-and-set**, for lease-fenced `completeDelivery`, `failDelivery`, `extendLeases` and `releaseDeliveries`.
-3. **An ordered query on due time**, for `claimEventsForFanout` and `claimDeliveries`. `completeFanout` must honor each new delivery's `run_after`, and `insertEvent` must persist `event.defer` and hand it back on later reads.
+3. **An ordered query on due time**, for `claimEventsForFanout` and `claimDeliveries`. `completeFanout` must honor each new delivery's `run_after`, and `insertEvent` must persist `event.defer_until` and hand it back on later reads.
 
 The behavioral contract every store must satisfy lives in this repo at [`test/contract.ts`](./test/contract.ts) (it is not part of the npm package); copy it and run `runStoreContract(name, setup)` against your store. [`src/memory/store.ts`](./src/memory/store.ts) is a compact reference implementation.
 

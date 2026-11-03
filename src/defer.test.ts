@@ -13,7 +13,7 @@ describe("normalizeDefer", () => {
     expect(normalizeDefer({ until }, "p")).toEqual({ until });
   });
 
-  it("revives an ISO string for until, as stored in JSON", () => {
+  it("accepts an ISO string for until", () => {
     const until = new Date("2030-01-01T00:00:00Z");
     expect(normalizeDefer({ until: until.toISOString() } as any, "p")).toEqual({
       until,

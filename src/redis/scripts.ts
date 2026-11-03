@@ -7,7 +7,7 @@
  * The default prefix carries a hash tag so all of txob's keys live in one cluster slot.
  *
  * Layout (P = prefix):
- *   P e:<event_id>                  hash: type, data, correlation_id, created_at, defer,
+ *   P e:<event_id>                  hash: type, data, correlation_id, created_at, defer_until,
  *                                   fanout_attempts, fanout_lease_token, fanned_out_at
  *   P fanout:<type>                 zset of unfanned events, by created_at
  *   P fanoutleased:<type>           zset of events leased for fan-out, by lease expiry
@@ -117,16 +117,16 @@ end
 
 /**
  * ARGV: P, id, type, data, created_at, correlation_id ('' for none, else '=' .. id),
- * defer ('' for none, else '=' .. JSON)
+ * defer_until ('' for none, else '=' .. ms since epoch)
  */
 export const insertEventScript = `${common}
-local id, t, data, created, corr, defer = ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
+local id, t, data, created, corr, defer_until = ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
 local ek = P .. 'e:' .. id
 -- MULTI can't abort, so a duplicate id is ignored rather than rejected
 if redis.call('EXISTS', ek) == 1 then return 0 end
 redis.call('HSET', ek, 'type', t, 'data', data, 'created_at', created, 'fanout_attempts', 0)
 if corr ~= '' then redis.call('HSET', ek, 'correlation_id', string.sub(corr, 2)) end
-if defer ~= '' then redis.call('HSET', ek, 'defer', string.sub(defer, 2)) end
+if defer_until ~= '' then redis.call('HSET', ek, 'defer_until', string.sub(defer_until, 2)) end
 redis.call('ZADD', P .. 'fanout:' .. t, created, id)
 redis.call('ZADD', P .. 'events', created, id)
 wakeup()

@@ -64,7 +64,7 @@ export interface TxobEventsTable {
   data: unknown;
   correlation_id: string | null;
   created_at: Generated<Date>;
-  defer: unknown | null;
+  defer_until: Timestamp | null;
   fanned_out_at: Timestamp | null;
   fanout_attempts: Generated<number>;
   fanout_run_after: Generated<Date>;

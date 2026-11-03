@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
-import { normalizeDefer } from "./defer.js";
+import { normalizeDefer, resolveDefer } from "./defer.js";
 import { TxOBValidationError } from "./error.js";
 import type { TxOBStore } from "./store.js";
 import type {
@@ -17,8 +17,8 @@ export type TxOBPublishOpts = {
   id?: string;
   correlation_id?: string | null;
   /**
-   * Delay every delivery of this event, overriding the handlers' `defer`. `delayMs` counts
-   * from publish time (`created_at`).
+   * Delay every delivery of this event, overriding the handlers' `defer`. Resolved now into
+   * `event.defer_until`; `delayMs` counts from publish time (`created_at`).
    */
   defer?: TxOBDefer | null;
 };
@@ -90,6 +90,7 @@ export const createOutbox = <
     if (!schema) {
       throw new Error(`unknown event type '${type}'`);
     }
+    const created_at = new Date();
     const event: TxOBEvent<
       typeof type,
       TxOBSchemaOutput<TEventSchemas[typeof type]>
@@ -100,8 +101,11 @@ export const createOutbox = <
         TEventSchemas[typeof type]
       >,
       correlation_id: publishOpts?.correlation_id ?? null,
-      created_at: new Date(),
-      defer: normalizeDefer(publishOpts?.defer ?? null, `publish('${type}')`),
+      created_at,
+      defer_until: resolveDefer(
+        normalizeDefer(publishOpts?.defer ?? null, `publish('${type}')`),
+        { created_at },
+      ),
     };
     await store.insertEvent(tx, event);
     return event;

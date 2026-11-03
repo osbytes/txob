@@ -1,17 +1,17 @@
 # Migrating from 0.5 to 0.6
 
-0.6 adds deferred delivery (`defer` on handler definitions and `publish`). Events gain a `defer` field, and new deliveries carry a `run_after`.
+0.6 adds deferred delivery (`defer` on handler definitions and `publish`). Events gain a `defer_until` timestamp, and new deliveries carry a `run_after`.
 
 - **Postgres:** add the column to existing tables. `migrate` and `getMigrationSql` include it for new installs only:
 
   ```sql
-  ALTER TABLE txob_events ADD COLUMN IF NOT EXISTS defer JSONB;
+  ALTER TABLE txob_events ADD COLUMN IF NOT EXISTS defer_until TIMESTAMPTZ;
   ```
 
   Drizzle users regenerate their migration from `txobTables()`.
 
-- **MongoDB, Redis, DynamoDB:** no migration; old events read back with `defer: null`.
-- **Custom stores:** persist and return `event.defer` from `insertEvent`, and apply `run_after` (a `Date`, or `null` for "now") when `completeFanout` creates deliveries. The store contract in `test/contract.ts` checks both.
+- **MongoDB, Redis, DynamoDB:** no migration; old events read back with `defer_until: null`.
+- **Custom stores:** persist `event.defer_until` (a `Date` or `null`) from `insertEvent` and return it on reads, and apply `run_after` (a `Date`, or `null` for "now") when `completeFanout` creates deliveries. The store contract in `test/contract.ts` checks both.
 
 # Migrating from 0.4 to 0.5
 

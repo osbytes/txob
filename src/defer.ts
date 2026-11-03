@@ -1,8 +1,8 @@
 import type { TxOBDefer, TxOBEvent } from "./types.js";
 
 /**
- * Validates a deferral and strips anything else, so what gets persisted is exactly
- * `{ delayMs }` or `{ until }`. Accepts an ISO string for `until`, as read back from JSON.
+ * Validates a deferral and strips anything else, leaving exactly `{ delayMs }` or `{ until }`.
+ * Accepts an ISO string for `until`.
  */
 export const normalizeDefer = (
   defer: TxOBDefer | null | undefined,

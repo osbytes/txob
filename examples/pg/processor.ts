@@ -50,7 +50,9 @@ const handlerMap = createEventHandlerMap({
       followUp: {
         defer: { delayMs: 3_600_000 },
         handler: async (event) => {
-          console.log(`${event.id} followUp ${JSON.stringify(event.defer)}`);
+          console.log(
+            `${event.id} followUp ${event.defer_until?.toISOString()}`,
+          );
         },
       },
 

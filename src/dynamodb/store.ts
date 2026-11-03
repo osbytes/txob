@@ -110,7 +110,8 @@ const toEvent = (item: Item): TxOBEvent => ({
   data: JSON.parse(item.data),
   correlation_id: item.correlation_id ?? null,
   created_at: new Date(item.created_at),
-  defer: item.defer ? JSON.parse(item.defer) : null,
+  defer_until:
+    item.defer_until === undefined ? null : new Date(item.defer_until),
 });
 
 const jitter = () =>
@@ -560,7 +561,9 @@ export const createDynamoStore = (
             data: JSON.stringify(event.data),
             correlation_id: event.correlation_id,
             created_at: event.created_at.getTime(),
-            ...(event.defer ? { defer: JSON.stringify(event.defer) } : {}),
+            ...(event.defer_until
+              ? { defer_until: event.defer_until.getTime() }
+              : {}),
             fanout_type: event.type,
             fanout_run_after: event.created_at.getTime(),
             fanout_attempts: 0,

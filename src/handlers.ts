@@ -73,7 +73,7 @@ export type TxOBHandlerConfig<TEvent> = {
   /**
    * Delay before deliveries of this handler become claimable. `delayMs` counts from the
    * event's `created_at`. Resolved when the event is fanned out, and overridden by a `defer`
-   * passed to `publish`. A function receives the event (including its `defer`).
+   * passed to `publish`. A function receives the event (including its `defer_until`).
    */
   defer?: TxOBDefer | ((event: TEvent) => TxOBDefer | null | undefined);
 };

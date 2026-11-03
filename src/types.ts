@@ -34,10 +34,10 @@ export type TxOBEvent<
   correlation_id: string | null;
   created_at: Date;
   /**
-   * Deferral requested when the event was published. Overrides the handlers' own `defer`
-   * for every delivery of this event. `null` when none was requested.
+   * Earliest time deliveries of this event may be claimed, resolved at publish time from the
+   * `defer` option. Overrides the handlers' own `defer`. `null` when none was requested.
    */
-  defer: TxOBDefer | null;
+  defer_until: Date | null;
 };
 
 export type TxOBEventFromSchemas<
