@@ -2,13 +2,13 @@ graph TB
     subgraph Application["Your Application"]
         AppTx["BEGIN"]
         AppData["Write business data"]
-        AppPublish["outbox.publish(tx, type, data)<br/>validates with the event's schema"]
+        AppPublish["outbox.publish(tx, type, data, { defer? })<br/>validates with the event's schema"]
         AppCommit["COMMIT"]
         AppTx --> AppData --> AppPublish --> AppCommit
     end
 
     subgraph Database["Store (Postgres, MongoDB, Redis, DynamoDB, ...)"]
-        Events[("txob_events<br/>id, type, data, correlation_id<br/>fanned_out_at, fanout lease")]
+        Events[("txob_events<br/>id, type, data, correlation_id, defer<br/>fanned_out_at, fanout lease")]
         Deliveries[("txob_deliveries<br/>one per (event, handler)<br/>status, attempts, priority,<br/>concurrency_key, run_after,<br/>lease_token, last_error")]
         Notify["Wakeup source<br/>pg_notify, change stream, pub/sub"]
     end
@@ -20,7 +20,7 @@ graph TB
     subgraph Processor["Event Processor (run N for scale)"]
         Wakeup["Wakeup emitter<br/>(optional; polling otherwise)"]
         Poll["Poll (interval, wakeup,<br/>completion, backoff timers)"]
-        Fanout["Fan-out<br/>lease unfanned events of handled types,<br/>create deliveries + mark fanned out<br/>(one statement, idempotent)"]
+        Fanout["Fan-out<br/>lease unfanned events of handled types,<br/>resolve priority, concurrency key, run_after (defer),<br/>create deliveries + mark fanned out<br/>(one statement, idempotent)"]
         Claim["Claim deliveries, priority order<br/>within limits counted across ALL processors:<br/>concurrency, per-key concurrency, rate limit<br/>(serialized per limited handler),<br/>set lease + token, attempts+1"]
         Run["Run handler<br/>signal aborted on: shutdown | timeoutMs | lease lost<br/>handler's own result decides the outcome"]
         Heartbeat["Heartbeat<br/>renew leases every leaseMs/3"]

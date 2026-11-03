@@ -58,6 +58,33 @@ describe("compileHandlerMap", () => {
     );
   });
 
+  it("normalizes a static defer and keeps a defer function", () => {
+    const until = new Date("2030-01-01T00:00:00Z");
+    const compiled = compileHandlerMap({
+      A: {
+        none: fn,
+        fixed: { handler: fn, defer: { delayMs: 500 } },
+        absolute: { handler: fn, defer: { until: until.toISOString() as any } },
+        dynamic: { handler: fn, defer: (e: any) => ({ delayMs: e.data.n }) },
+      },
+    });
+    const [none, fixed, absolute, dynamic] = compiled.get("A")!;
+    expect(none.defer({})).toBeNull();
+    expect(fixed.defer({})).toEqual({ delayMs: 500 });
+    expect(absolute.defer({})).toEqual({ until });
+    expect(dynamic.defer({ data: { n: 7 } })).toEqual({ delayMs: 7 });
+  });
+
+  it.each([
+    [{ handler: fn, defer: { delayMs: -1 } }, "defer.delayMs"],
+    [{ handler: fn, defer: { until: "soon" } }, "defer.until"],
+    [{ handler: fn, defer: {} }, "defer must be"],
+  ])("rejects invalid defer %#", (definition, message) => {
+    expect(() => compileHandlerMap({ A: { h: definition as any } })).toThrow(
+      message,
+    );
+  });
+
   it("rejects handler names containing ':'", () => {
     expect(() => compileHandlerMap({ A: { "a:b": fn } })).toThrow(
       "cannot contain ':'",
@@ -283,6 +310,102 @@ describe("EventProcessor with a faulty store", () => {
         }),
       }),
     );
+  });
+
+  it("leaves an event unfanned when a handler's defer function returns an invalid value", async () => {
+    const { base, processor, errors } = await setup(() => ({}), {
+      E: {
+        h: {
+          defer: () => ({ delayMs: -5 }),
+          handler: async () => {},
+        },
+      },
+    });
+    await waitFor(() => errors.length > 0);
+    await processor.stop();
+    expect(base.getEvents()[0].fanned_out_at).toBeNull();
+    expect(base.getDeliveries()).toHaveLength(0);
+    expect(errors).toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: expect.stringContaining("E.h.defer: defer.delayMs"),
+        }),
+      }),
+    );
+  });
+
+  it("resolves run_after at fan-out: publish defer wins over the handler's, delayMs counts from created_at", async () => {
+    const seen: unknown[] = [];
+    const { base, processor } = await setup(() => ({}), {
+      E: {
+        fixed: { defer: { delayMs: 60_000 }, handler: async () => {} },
+        fromEvent: {
+          defer: (event) => (event.defer ? null : { delayMs: 30_000 }),
+          handler: async () => {},
+        },
+        none: async (event) => void seen.push(event.defer),
+      },
+    });
+    const outbox = createOutbox({ eventSchemas, store: base });
+    const until = new Date(Date.now() + 120_000);
+    const [overridden, absolute] = await base.transaction(async (tx) => [
+      await outbox.publish(tx, "E", { k: "o" }, { defer: { delayMs: 5_000 } }),
+      await outbox.publish(tx, "E", { k: "u" }, { defer: { until } }),
+    ]);
+    await waitFor(() => base.getEvents().every((e) => e.fanned_out_at));
+    await processor.stop();
+
+    const runAfter = (eventId: string, handler: string) =>
+      base
+        .getDeliveries()
+        .find((d) => d.event_id === eventId && d.handler === handler)!
+        .run_after;
+    const plain = base.getEvents().find((e) => e.data.k === "a")!;
+    expect(runAfter(plain.id, "fixed")).toBe(
+      plain.created_at.getTime() + 60_000,
+    );
+    expect(runAfter(plain.id, "fromEvent")).toBe(
+      plain.created_at.getTime() + 30_000,
+    );
+    expect(
+      base
+        .getDeliveries()
+        .find((d) => d.event_id === plain.id && d.handler === "none")?.status,
+    ).toBe("completed");
+    for (const handler of ["fixed", "fromEvent", "none"]) {
+      expect(runAfter(overridden.id, handler)).toBe(
+        overridden.created_at.getTime() + 5_000,
+      );
+      expect(runAfter(absolute.id, handler)).toBe(until.getTime());
+    }
+    expect(base.getEvents().find((e) => e.id === absolute.id)?.defer).toEqual({
+      until,
+    });
+  });
+
+  it("runs a deferred delivery when it becomes due, ahead of the next poll", async () => {
+    const ran: number[] = [];
+    const base = createMemoryStore();
+    const processor = createEventProcessor({
+      store: base,
+      eventSchemas,
+      handlerMap: { E: { h: async () => void ran.push(Date.now()) } },
+      pollingIntervalMs: 60_000,
+      wakeupEmitter: base.wakeupEmitter,
+      logger: silentLogger,
+    });
+    processor.start();
+    const outbox = createOutbox({ eventSchemas, store: base });
+    const publishedAt = Date.now();
+    await base.transaction((tx) =>
+      outbox.publish(tx, "E", { k: "d" }, { defer: { delayMs: 300 } }),
+    );
+    // The insert wakes the processor up, which fans the event out; from then on only the
+    // due-time timer can start the delivery before the 60s poll
+    await waitFor(() => ran.length === 1, { timeoutMs: 5_000 });
+    await processor.stop();
+    expect(ran[0] - publishedAt).toBeGreaterThanOrEqual(290);
+    expect(ran[0] - publishedAt).toBeLessThan(3_000);
   });
 
   it("aborts handlers whose lease could not be renewed before it expired", async () => {

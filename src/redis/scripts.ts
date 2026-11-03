@@ -7,7 +7,7 @@
  * The default prefix carries a hash tag so all of txob's keys live in one cluster slot.
  *
  * Layout (P = prefix):
- *   P e:<event_id>                  hash: type, data, correlation_id, created_at,
+ *   P e:<event_id>                  hash: type, data, correlation_id, created_at, defer,
  *                                   fanout_attempts, fanout_lease_token, fanned_out_at
  *   P fanout:<type>                 zset of unfanned events, by created_at
  *   P fanoutleased:<type>           zset of events leased for fan-out, by lease expiry
@@ -115,14 +115,18 @@ local function before(score_a, member_a, score_b, member_b)
 end
 `;
 
-/** ARGV: P, id, type, data, created_at, correlation_id ('' for none, else '=' .. id) */
+/**
+ * ARGV: P, id, type, data, created_at, correlation_id ('' for none, else '=' .. id),
+ * defer ('' for none, else '=' .. JSON)
+ */
 export const insertEventScript = `${common}
-local id, t, data, created, corr = ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6]
+local id, t, data, created, corr, defer = ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
 local ek = P .. 'e:' .. id
 -- MULTI can't abort, so a duplicate id is ignored rather than rejected
 if redis.call('EXISTS', ek) == 1 then return 0 end
 redis.call('HSET', ek, 'type', t, 'data', data, 'created_at', created, 'fanout_attempts', 0)
 if corr ~= '' then redis.call('HSET', ek, 'correlation_id', string.sub(corr, 2)) end
+if defer ~= '' then redis.call('HSET', ek, 'defer', string.sub(defer, 2)) end
 redis.call('ZADD', P .. 'fanout:' .. t, created, id)
 redis.call('ZADD', P .. 'events', created, id)
 wakeup()
@@ -166,7 +170,7 @@ return out
 
 /**
  * ARGV: P, n, ...event ids (n), then per delivery: event_id, type, handler, priority,
- * concurrency key ('' for none, else '=' .. key)
+ * concurrency key ('' for none, else '=' .. key), run_after ms ('' for now)
  */
 export const completeFanoutScript = `${common}
 local now = now_ms()
@@ -174,7 +178,7 @@ local n = tonumber(ARGV[2])
 local created = 0
 local i = 3 + n
 while i <= #ARGV do
-  local eid, t, h, pr, ck = ARGV[i], ARGV[i + 1], ARGV[i + 2], ARGV[i + 3], ARGV[i + 4]
+  local eid, t, h, pr, ck, ra = ARGV[i], ARGV[i + 1], ARGV[i + 2], ARGV[i + 3], ARGV[i + 4], ARGV[i + 5]
   local id = eid .. ':' .. h
   local dk = P .. 'd:' .. id
   if redis.call('EXISTS', dk) == 0 then
@@ -182,10 +186,18 @@ while i <= #ARGV do
       'attempts', 0, 'priority', pr, 'created_at', now)
     if ck ~= '' then redis.call('HSET', dk, 'concurrency_key', string.sub(ck, 2)) end
     redis.call('ZADD', P .. 'deliveries', now, id)
-    make_ready(dk, id, now)
+    local run_after = now
+    if ra ~= '' then run_after = tonumber(ra) end
+    if run_after > now then
+      -- Waits in the delayed queue until due, like a retry
+      redis.call('HSET', dk, 'run_after', run_after)
+      redis.call('ZADD', slot_key('delayed', t, h), run_after, id)
+    else
+      make_ready(dk, id, now)
+    end
     created = created + 1
   end
-  i = i + 5
+  i = i + 6
 end
 for j = 3, 2 + n do
   local id = ARGV[j]

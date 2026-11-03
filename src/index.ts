@@ -1,5 +1,6 @@
 export * from "./processor.js";
 export * from "./outbox.js";
+export * from "./defer.js";
 export * from "./handlers.js";
 export * from "./store.js";
 export * from "./types.js";

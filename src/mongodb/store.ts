@@ -26,6 +26,7 @@ type EventDoc = {
   data: TxOBEvent["data"];
   correlation_id: string | null;
   created_at: Date;
+  defer: TxOBEvent["defer"];
   fanned_out_at: Date | null;
   fanout_attempts: number;
   fanout_run_after: Date;
@@ -82,6 +83,7 @@ const toEvent = (doc: EventDoc): TxOBEvent => ({
   data: doc.data,
   correlation_id: doc.correlation_id,
   created_at: doc.created_at,
+  defer: doc.defer ?? null,
 });
 
 const isDuplicateKey = (error: unknown): boolean =>
@@ -262,6 +264,7 @@ export const createMongoStore = (
           data: event.data,
           correlation_id: event.correlation_id,
           created_at: event.created_at,
+          defer: event.defer,
           fanned_out_at: null,
           fanout_attempts: 0,
           fanout_run_after: event.created_at,
@@ -323,7 +326,7 @@ export const createMongoStore = (
                 ...d,
                 status: "pending",
                 attempts: 0,
-                run_after: now,
+                run_after: d.run_after ?? now,
                 lease_token: null,
                 last_error: null,
                 created_at: now,

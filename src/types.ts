@@ -18,6 +18,12 @@ export type TxOBSchemaOutput<TSchema> =
 export type TxOBEventTypeOf<TEventSchemas extends TxOBEventSchemaMap> =
   keyof TEventSchemas & string;
 
+/**
+ * When deliveries become claimable. `delayMs` counts from the event's `created_at`, so it
+ * resolves to the same time however often fan-out runs; `until` is an absolute time.
+ */
+export type TxOBDefer = { delayMs: number } | { until: Date };
+
 export type TxOBEvent<
   TEventType extends string = string,
   TData = TxOBEventData,
@@ -27,6 +33,11 @@ export type TxOBEvent<
   data: TData;
   correlation_id: string | null;
   created_at: Date;
+  /**
+   * Deferral requested when the event was published. Overrides the handlers' own `defer`
+   * for every delivery of this event. `null` when none was requested.
+   */
+  defer: TxOBDefer | null;
 };
 
 export type TxOBEventFromSchemas<

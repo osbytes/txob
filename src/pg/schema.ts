@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS ${events} (
   data JSONB NOT NULL,
   correlation_id TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- deferral requested at publish time, resolved at fan-out
+  defer JSONB,
   fanned_out_at TIMESTAMPTZ,
   fanout_attempts INTEGER NOT NULL DEFAULT 0,
   -- when the event may next be fanned out; doubles as the fan-out lease expiry

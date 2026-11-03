@@ -5,6 +5,7 @@ import {
   TxOBTimeoutError,
   TxOBValidationError,
 } from "./error.js";
+import { normalizeDefer, resolveDefer } from "./defer.js";
 import {
   compileHandlerMap,
   type CompiledHandler,
@@ -478,11 +479,15 @@ export class EventProcessor<
 
     const eventIds: string[] = [];
     const deliveries: TxOBNewDelivery[] = [];
+    let firstDue: Date | null = null;
     for (const event of events) {
       try {
+        // Stores hand `defer` back as plain JSON; revive `until` and reject corrupt values
+        const eventDefer = normalizeDefer(event.defer, `${event.type}.defer`);
+        const revived = { ...event, defer: eventDefer };
         const eventDeliveries = (this.handlers.get(event.type) ?? []).map(
           (handler): TxOBNewDelivery => {
-            const priority = handler.priority(event);
+            const priority = handler.priority(revived);
             if (
               !Number.isInteger(priority) ||
               Math.abs(priority) > maxPriority
@@ -491,11 +496,23 @@ export class EventProcessor<
                 `${event.type}.${handler.name}: priority must be a 32-bit integer, got ${priority}`,
               );
             }
-            const key = handler.perKey ? handler.perKey.key(event) : null;
+            const key = handler.perKey ? handler.perKey.key(revived) : null;
             if (key !== null && typeof key !== "string") {
               throw new Error(
                 `${event.type}.${handler.name}: concurrency key must be a string or null, got ${typeof key}`,
               );
+            }
+            // The publisher's request wins over the handler's default
+            const path = `${event.type}.${handler.name}`;
+            const defer =
+              eventDefer ??
+              normalizeDefer(handler.defer(revived), `${path}.defer`);
+            const run_after = resolveDefer(defer, event);
+            if (
+              run_after !== null &&
+              (firstDue === null || run_after < firstDue)
+            ) {
+              firstDue = run_after;
             }
             return {
               event_id: event.id,
@@ -503,6 +520,7 @@ export class EventProcessor<
               handler: handler.name,
               priority,
               concurrency_key: key,
+              run_after,
             };
           },
         );
@@ -518,7 +536,7 @@ export class EventProcessor<
             fanoutAttempts: event.fanout_attempts,
             error,
           },
-          "error computing deliveries for event (invalid priority or concurrency key)",
+          "error computing deliveries for event (invalid priority, concurrency key or defer)",
         );
       }
     }
@@ -535,6 +553,8 @@ export class EventProcessor<
         {},
         eventIds.length,
       );
+      // Deferred deliveries don't trigger a wakeup when they become due
+      if (firstDue !== null) this.scheduleTick(firstDue);
     }
     setTelemetrySpanAttributes(span, {
       [TxOBTelemetryAttributeKey.EventsFannedOut]: eventIds.length,
@@ -834,15 +854,18 @@ export class EventProcessor<
       : TxOBTelemetryDeliveryOutcome.LeaseLost;
   }
 
-  /** Poll when a backed-off delivery becomes due instead of waiting for the next interval. */
+  /** Poll when a deferred or backed-off delivery becomes due instead of waiting for the next interval. */
   private scheduleTick(at: Date): void {
     if (this.state !== "started") return;
+    const delayMs = at.getTime() - Date.now();
+    // A regular poll gets there first; also keeps clear of setTimeout's ~24.8 day limit
+    if (delayMs > this.opts.pollingIntervalMs) return;
     const timer = setTimeout(
       () => {
         this.timers.delete(timer);
         this.requestTick();
       },
-      Math.max(at.getTime() - Date.now(), 0),
+      Math.max(delayMs, 0),
     );
     timer.unref?.();
     this.timers.add(timer);

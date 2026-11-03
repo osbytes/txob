@@ -1,4 +1,6 @@
+import { normalizeDefer } from "./defer.js";
 import type {
+  TxOBDefer,
   TxOBEventFromSchemas,
   TxOBEventSchemaMap,
   TxOBEventTypeOf,
@@ -68,6 +70,12 @@ export type TxOBHandlerConfig<TEvent> = {
   timeoutMs?: number;
   /** Higher runs first. Computed when the event is fanned out. Default: 0. */
   priority?: number | ((event: TEvent) => number);
+  /**
+   * Delay before deliveries of this handler become claimable. `delayMs` counts from the
+   * event's `created_at`. Resolved when the event is fanned out, and overridden by a `defer`
+   * passed to `publish`. A function receives the event (including its `defer`).
+   */
+  defer?: TxOBDefer | ((event: TEvent) => TxOBDefer | null | undefined);
 };
 
 export type TxOBHandlerDefinition<TEvent> =
@@ -130,6 +138,7 @@ export type CompiledHandler = {
   backoff: (ctx: TxOBBackoffContext<any>) => number | Date;
   timeoutMs?: number;
   priority: (event: any) => number;
+  defer: (event: any) => TxOBDefer | null | undefined;
 };
 
 const assertPositiveInt = (value: number, path: string): void => {
@@ -230,6 +239,10 @@ export const compileHandlerMap = (
       }
 
       const priority = config.priority ?? 0;
+      const defer =
+        typeof config.defer === "function"
+          ? config.defer
+          : normalizeDefer(config.defer, `${path}.defer`);
 
       compiledHandlers.push({
         eventType,
@@ -242,6 +255,7 @@ export const compileHandlerMap = (
         backoff: retry.backoff ?? defaultBackoff,
         timeoutMs,
         priority: typeof priority === "function" ? priority : () => priority,
+        defer: typeof defer === "function" ? defer : () => defer,
       });
     }
     compiled.set(eventType, compiledHandlers);

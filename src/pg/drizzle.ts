@@ -75,6 +75,7 @@ export const txobTables = (opts: PgTableOpts = {}) => {
       data: jsonb("data").notNull(),
       correlation_id: text("correlation_id"),
       created_at: timestamptz("created_at").notNull().defaultNow(),
+      defer: jsonb("defer"),
       fanned_out_at: timestamptz("fanned_out_at"),
       fanout_attempts: integer("fanout_attempts").notNull().default(0),
       fanout_run_after: timestamptz("fanout_run_after").notNull().defaultNow(),

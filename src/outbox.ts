@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
+import { normalizeDefer } from "./defer.js";
 import { TxOBValidationError } from "./error.js";
 import type { TxOBStore } from "./store.js";
 import type {
+  TxOBDefer,
   TxOBEvent,
   TxOBEventSchemaMap,
   TxOBEventTypeOf,
@@ -14,6 +16,11 @@ export type TxOBPublishOpts = {
   /** Defaults to a random UUID. */
   id?: string;
   correlation_id?: string | null;
+  /**
+   * Delay every delivery of this event, overriding the handlers' `defer`. `delayMs` counts
+   * from publish time (`created_at`).
+   */
+  defer?: TxOBDefer | null;
 };
 
 export type TxOBPublish<TEventSchemas extends TxOBEventSchemaMap, TTx> = <
@@ -94,6 +101,7 @@ export const createOutbox = <
       >,
       correlation_id: publishOpts?.correlation_id ?? null,
       created_at: new Date(),
+      defer: normalizeDefer(publishOpts?.defer ?? null, `publish('${type}')`),
     };
     await store.insertEvent(tx, event);
     return event;
