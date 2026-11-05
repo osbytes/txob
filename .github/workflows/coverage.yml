@@ -4,7 +4,7 @@ on: [push, pull_request]
 
 jobs:
   build:
-    runs-on: ubuntu-24.04 # ubuntu-26.04 kernel 7.0.x cannot run mongod 8 (rseq ABI); revisit when runner kernel >= 7.0.14
+    runs-on: ubuntu-latest
 
     services:
       postgres:
@@ -37,7 +37,9 @@ jobs:
 
       - name: Start MongoDB replica set
         run: |
-          docker run -d --name mongo -p 27017:27017 mongo:8 --replSet rs0 --bind_ip_all
+          # mongo:9 until the mongo:8 image reaches 8.3.16 / 8.0.37: earlier mongod 8 builds refuse to
+          # start on the runners' Ubuntu kernels (SERVER-131779)
+          docker run -d --name mongo -p 27017:27017 mongo:9 --replSet rs0 --bind_ip_all
           fail() { echo "::error::$1"; docker ps -a; docker logs mongo; exit 1; }
           for i in $(seq 1 30); do
             docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]}).ok' && break
