@@ -38,11 +38,17 @@ jobs:
       - name: Start MongoDB replica set
         run: |
           docker run -d --name mongo -p 27017:27017 mongo:8 --replSet rs0 --bind_ip_all
+          fail() { echo "::error::$1"; docker ps -a; docker logs mongo; exit 1; }
           for i in $(seq 1 30); do
             docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]}).ok' && break
+            [ "$i" = 30 ] && fail "rs.initiate never succeeded"
             sleep 1
           done
-          until docker exec mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' | grep -q PRIMARY; do sleep 1; done
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' | grep -q PRIMARY && exit 0
+            sleep 1
+          done
+          fail "replica set never became PRIMARY"
 
       - name: Start Redis and DynamoDB Local
         run: |
