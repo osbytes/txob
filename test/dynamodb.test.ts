@@ -18,7 +18,7 @@ import { createDynamoTestClient } from "./helpers.js";
  * Integration tests against DynamoDB (or DynamoDB Local). Skipped unless
  * TXOB_TEST_DYNAMODB_URL is set, e.g.
  *   docker run --rm -p 18000:8000 amazon/dynamodb-local
- *   TXOB_TEST_DYNAMODB_URL=http://localhost:18000 yarn test
+ *   TXOB_TEST_DYNAMODB_URL=http://localhost:18000 pnpm test
  */
 const url = process.env.TXOB_TEST_DYNAMODB_URL;
 

@@ -1,0 +1,17 @@
+packages:
+  - "."
+  - "examples/*"
+
+# Security pins for vulnerable transitive dev dependencies (carried over from yarn `resolutions`)
+overrides:
+  "picomatch@>=2 <2.3.2": "2.3.2"
+  "cross-spawn@>=6 <6.0.6": "6.0.6"
+  "minimatch@>=3 <3.1.5": "3.1.5"
+  "brace-expansion@>=1 <1.1.21": "1.1.21"
+  "diff@>=4 <4.0.4": "4.0.4"
+  "@esbuild-kit/core-utils>esbuild": "0.25.12"
+
+allowBuilds:
+  "@prisma/engines": true
+  esbuild: true
+  prisma: true

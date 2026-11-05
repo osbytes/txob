@@ -1,4 +1,4 @@
-// Compile-time checks (run by `yarn typecheck`, never executed): each adapter infers the
+// Compile-time checks (run by `pnpm typecheck`, never executed): each adapter infers the
 // ORM's own transaction type, so publish accepts it and rejects anything else.
 import { drizzle } from "drizzle-orm/node-postgres";
 import knex from "knex";

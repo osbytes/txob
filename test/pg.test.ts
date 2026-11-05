@@ -12,7 +12,7 @@ import { runStoreContract } from "./contract.js";
 /**
  * Integration tests against a real Postgres. Skipped unless TXOB_TEST_PG_URL is set, e.g.
  *   docker run --rm -e POSTGRES_PASSWORD=txob -p 54329:5432 postgres:17-alpine
- *   TXOB_TEST_PG_URL=postgres://postgres:txob@localhost:54329/postgres yarn test
+ *   TXOB_TEST_PG_URL=postgres://postgres:txob@localhost:54329/postgres pnpm test
  */
 const connectionString = process.env.TXOB_TEST_PG_URL;
 
