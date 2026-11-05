@@ -5,6 +5,7 @@ import {
   TxOBTimeoutError,
   TxOBValidationError,
 } from "./error.js";
+import { normalizeDefer, resolveDefer } from "./defer.js";
 import {
   compileHandlerMap,
   type CompiledHandler,
@@ -478,6 +479,7 @@ export class EventProcessor<
 
     const eventIds: string[] = [];
     const deliveries: TxOBNewDelivery[] = [];
+    let firstDue: Date | null = null;
     for (const event of events) {
       try {
         const eventDeliveries = (this.handlers.get(event.type) ?? []).map(
@@ -497,12 +499,29 @@ export class EventProcessor<
                 `${event.type}.${handler.name}: concurrency key must be a string or null, got ${typeof key}`,
               );
             }
+            // The publisher's request wins over the handler's default
+            const run_after =
+              event.defer_until ??
+              resolveDefer(
+                normalizeDefer(
+                  handler.defer(event),
+                  `${event.type}.${handler.name}.defer`,
+                ),
+                event,
+              );
+            if (
+              run_after !== null &&
+              (firstDue === null || run_after < firstDue)
+            ) {
+              firstDue = run_after;
+            }
             return {
               event_id: event.id,
               event_type: event.type,
               handler: handler.name,
               priority,
               concurrency_key: key,
+              run_after,
             };
           },
         );
@@ -518,7 +537,7 @@ export class EventProcessor<
             fanoutAttempts: event.fanout_attempts,
             error,
           },
-          "error computing deliveries for event (invalid priority or concurrency key)",
+          "error computing deliveries for event (invalid priority, concurrency key or defer)",
         );
       }
     }
@@ -535,6 +554,8 @@ export class EventProcessor<
         {},
         eventIds.length,
       );
+      // Deferred deliveries don't trigger a wakeup when they become due
+      if (firstDue !== null) this.scheduleTick(firstDue);
     }
     setTelemetrySpanAttributes(span, {
       [TxOBTelemetryAttributeKey.EventsFannedOut]: eventIds.length,
@@ -834,15 +855,18 @@ export class EventProcessor<
       : TxOBTelemetryDeliveryOutcome.LeaseLost;
   }
 
-  /** Poll when a backed-off delivery becomes due instead of waiting for the next interval. */
+  /** Poll when a deferred or backed-off delivery becomes due instead of waiting for the next interval. */
   private scheduleTick(at: Date): void {
     if (this.state !== "started") return;
+    const delayMs = at.getTime() - Date.now();
+    // A regular poll gets there first; also keeps clear of setTimeout's ~24.8 day limit
+    if (delayMs > this.opts.pollingIntervalMs) return;
     const timer = setTimeout(
       () => {
         this.timers.delete(timer);
         this.requestTick();
       },
-      Math.max(at.getTime() - Date.now(), 0),
+      Math.max(delayMs, 0),
     );
     timer.unref?.();
     this.timers.add(timer);

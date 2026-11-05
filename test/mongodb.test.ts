@@ -11,7 +11,7 @@ import { runStoreContract } from "./contract.js";
 /**
  * Integration tests against a real MongoDB replica set. Skipped unless TXOB_TEST_MONGO_URL is
  * set, e.g.
- *   docker run --rm -p 27019:27017 mongo:8 --replSet rs0 --bind_ip_all
+ *   docker run --rm -p 27019:27017 mongo:9 --replSet rs0 --bind_ip_all
  *   docker exec <id> mongosh --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
  *   TXOB_TEST_MONGO_URL="mongodb://localhost:27019/?directConnection=true" yarn test
  */

@@ -91,6 +91,7 @@ type DeliveryRow = {
   data: TxOBEvent["data"];
   correlation_id: string | null;
   event_created_at: Date;
+  defer_until: Date | null;
 };
 
 const toDelivery = (row: DeliveryRow): TxOBDelivery => ({
@@ -107,6 +108,7 @@ const toDelivery = (row: DeliveryRow): TxOBDelivery => ({
     data: toJson(row.data),
     correlation_id: row.correlation_id,
     created_at: toDate(row.event_created_at),
+    defer_until: row.defer_until === null ? null : toDate(row.defer_until),
   },
 });
 
@@ -219,7 +221,7 @@ WITH slots AS (
   WHERE s.rate_max IS NOT NULL AND r.event_type = s.event_type AND r.handler = s.handler
     AND r.claimed_at <= now() - ${ms("s.rate_ms")}
 )
-SELECT claimed.*, e.type, e.data, e.correlation_id, e.created_at AS event_created_at
+SELECT claimed.*, e.type, e.data, e.correlation_id, e.created_at AS event_created_at, e.defer_until
 FROM claimed JOIN ${events} e ON e.id = claimed.event_id
 ORDER BY claimed.priority DESC`;
 
@@ -237,7 +239,7 @@ RETURNING 1`;
     insertEvent: async (tx, event) => {
       await db.queryIn(
         tx,
-        `INSERT INTO ${events} (id, type, data, correlation_id, created_at) VALUES ($1, $2, $3::text::jsonb, $4, $5)`,
+        `INSERT INTO ${events} (id, type, data, correlation_id, created_at, defer_until) VALUES ($1, $2, $3::text::jsonb, $4, $5, $6)`,
         [
           event.id,
           event.type,
@@ -245,6 +247,7 @@ RETURNING 1`;
           event.correlation_id,
           // ISO strings: some drivers (e.g. Drizzle on postgres.js) don't encode Dates
           event.created_at.toISOString(),
+          event.defer_until?.toISOString() ?? null,
         ],
       );
     },
@@ -264,13 +267,14 @@ FROM (
   FOR UPDATE SKIP LOCKED
 ) claimable
 WHERE e.id = claimable.id
-RETURNING e.id, e.type, e.data, e.correlation_id, e.created_at, e.fanout_attempts, e.fanout_lease_token`,
+RETURNING e.id, e.type, e.data, e.correlation_id, e.created_at, e.defer_until, e.fanout_attempts, e.fanout_lease_token`,
         [types, limit, leaseMs],
       );
       return rows.map((row) => ({
         ...row,
         data: toJson(row.data),
         created_at: toDate(row.created_at),
+        defer_until: row.defer_until === null ? null : toDate(row.defer_until),
       })) as TxOBFanoutEvent[];
     },
 
@@ -280,18 +284,22 @@ RETURNING e.id, e.type, e.data, e.correlation_id, e.created_at, e.fanout_attempt
       await db.query(
         `
 WITH inserted AS (
-  INSERT INTO ${deliveries} (event_id, event_type, handler, priority, concurrency_key)
-  SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::text[])
+  INSERT INTO ${deliveries} (event_id, event_type, handler, priority, concurrency_key, run_after)
+  SELECT event_id, event_type, handler, priority, concurrency_key, COALESCE(run_after::timestamptz, now())
+  -- run_after as text: postgres.js (under Drizzle) can't encode timestamptz[] parameters
+  FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::text[], $6::text[])
+    AS n (event_id, event_type, handler, priority, concurrency_key, run_after)
   ON CONFLICT (event_id, handler) DO NOTHING
 )
 UPDATE ${events} SET fanned_out_at = now(), fanout_lease_token = NULL
-WHERE id = ANY($6::text[])`,
+WHERE id = ANY($7::text[])`,
         [
           newDeliveries.map((d) => d.event_id),
           newDeliveries.map((d) => d.event_type),
           newDeliveries.map((d) => d.handler),
           newDeliveries.map((d) => d.priority),
           newDeliveries.map((d) => d.concurrency_key),
+          newDeliveries.map((d) => d.run_after?.toISOString() ?? null),
           event_ids,
         ],
       );

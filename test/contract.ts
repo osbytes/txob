@@ -190,6 +190,7 @@ export const runStoreContract = <TTx>(
           handler: "email",
           priority: 0,
           concurrency_key: null,
+          run_after: null,
         };
         await h.store.completeFanout({
           event_ids: [event.id],
@@ -221,6 +222,7 @@ export const runStoreContract = <TTx>(
               handler: "a",
               priority: i,
               concurrency_key: null,
+              run_after: null,
             },
             {
               event_id: e.id,
@@ -228,6 +230,7 @@ export const runStoreContract = <TTx>(
               handler: "b",
               priority: 0,
               concurrency_key: null,
+              run_after: null,
             },
           ]),
         });
@@ -279,6 +282,7 @@ export const runStoreContract = <TTx>(
               handler: "capped",
               priority: 0,
               concurrency_key: null,
+              run_after: null,
             },
             {
               event_id: e.id,
@@ -286,6 +290,7 @@ export const runStoreContract = <TTx>(
               handler: "keyed",
               priority: 0,
               concurrency_key: e.data.accountId,
+              run_after: null,
             },
             {
               event_id: e.id,
@@ -293,6 +298,7 @@ export const runStoreContract = <TTx>(
               handler: "rated",
               priority: 0,
               concurrency_key: null,
+              run_after: null,
             },
           ]),
         });
@@ -370,6 +376,7 @@ export const runStoreContract = <TTx>(
                 handler: `capped${round}`,
                 priority: 0,
                 concurrency_key: null,
+                run_after: null,
               },
               {
                 event_id: e.id,
@@ -377,6 +384,7 @@ export const runStoreContract = <TTx>(
                 handler: `keyed${round}`,
                 priority: 0,
                 concurrency_key: e.data.accountId,
+                run_after: null,
               },
             ]),
           });
@@ -433,6 +441,7 @@ export const runStoreContract = <TTx>(
             handler: "keyed",
             priority: 0,
             concurrency_key: e.data.accountId,
+            run_after: null,
           })),
         });
         const slots = [
@@ -490,6 +499,7 @@ export const runStoreContract = <TTx>(
             handler: "a",
             priority: 0,
             concurrency_key: null,
+            run_after: null,
           })),
         });
         const slots = [
@@ -529,6 +539,7 @@ export const runStoreContract = <TTx>(
               handler: "a",
               priority: 0,
               concurrency_key: null,
+              run_after: null,
             },
           ],
         });
@@ -569,6 +580,7 @@ export const runStoreContract = <TTx>(
             handler: "a",
             priority: 0,
             concurrency_key: null,
+            run_after: null,
           })),
         });
         void event;
@@ -593,6 +605,54 @@ export const runStoreContract = <TTx>(
         ).toHaveLength(1);
       });
 
+      it("holds deliveries with a future run_after until it passes", async () => {
+        const [event] = await publishUsers(1);
+        const soon = new Date(Date.now() + 400);
+        await h.store.completeFanout({
+          event_ids: [event.id],
+          deliveries: [
+            {
+              event_id: event.id,
+              event_type: "UserCreated",
+              handler: "later",
+              priority: 0,
+              concurrency_key: null,
+              run_after: soon,
+            },
+            {
+              event_id: event.id,
+              event_type: "UserCreated",
+              handler: "now",
+              priority: 0,
+              concurrency_key: null,
+              run_after: null,
+            },
+          ],
+        });
+        const claim = () =>
+          h.store.claimDeliveries({
+            slots: ["later", "now"].map((handler) => ({
+              event_type: "UserCreated",
+              handler,
+              limit: 10,
+            })),
+            limit: 10,
+            leaseMs: 10_000,
+          });
+        expect((await claim()).map((d) => d.handler)).toEqual(["now"]);
+        // The store's clock decides when it is due; allow for skew against this process
+        let claimed: TxOBDelivery[] = [];
+        await waitFor(
+          async () => {
+            claimed = await claim();
+            return claimed.length > 0;
+          },
+          { intervalMs: 50 },
+        );
+        expect(Date.now()).toBeGreaterThanOrEqual(soon.getTime() - 100);
+        expect(claimed.map((d) => d.handler)).toEqual(["later"]);
+      });
+
       it("fences writes with the lease token", async () => {
         const [event] = await publishUsers(1);
         await h.store.completeFanout({
@@ -604,6 +664,7 @@ export const runStoreContract = <TTx>(
               handler: "a",
               priority: 0,
               concurrency_key: null,
+              run_after: null,
             },
           ],
         });
@@ -910,6 +971,7 @@ export const runStoreContract = <TTx>(
             data: { userId: 42 },
             correlation_id: null,
             created_at: new Date(),
+            defer_until: null,
           }),
         );
         await waitFor(async () => (await deliveriesBy("dead")).length === 1);
@@ -1086,6 +1148,57 @@ export const runStoreContract = <TTx>(
         });
         await waitFor(() => order.length === 5);
         expect(order[0]).toBe("o3");
+      });
+
+      it("defers deliveries, with the publish-time defer overriding the handler's", async () => {
+        const ran: Record<string, { at: number; defer_until: Date | null }[]> =
+          {};
+        const record =
+          (name: string) =>
+          async (event: TxOBEvent): Promise<void> => {
+            (ran[name] ??= []).push({
+              at: Date.now(),
+              defer_until: event.defer_until,
+            });
+          };
+        startProcessor({
+          handlerMap: {
+            ...baseHandlers,
+            UserCreated: {
+              immediate: record("immediate"),
+              delayed: { defer: { delayMs: 500 }, handler: record("delayed") },
+            },
+          },
+        });
+        const publishedAt = Date.now();
+        const [plain] = await publishUsers(1);
+        // Overrides the handler default, so `delayed` runs right away for this one
+        const [rushed] = await h.transaction(async (tx) => [
+          await outbox.publish(
+            tx,
+            "UserCreated",
+            { userId: "rush", email: "r@x.io" },
+            { defer: { delayMs: 0 } },
+          ),
+        ]);
+        await waitFor(
+          async () => (await deliveriesBy("completed")).length === 3,
+          { timeoutMs: 2_000 },
+        );
+        // Only plain.delayed is still waiting
+        expect(ran.immediate).toHaveLength(2);
+        expect(ran.delayed).toHaveLength(1);
+        expect(ran.delayed[0].defer_until).toEqual(rushed.created_at);
+        await waitFor(
+          async () => (await deliveriesBy("completed")).length === 4,
+          { timeoutMs: 5_000 },
+        );
+        expect(ran.delayed).toHaveLength(2);
+        expect(ran.delayed[1].at - publishedAt).toBeGreaterThanOrEqual(490);
+        expect(ran.delayed[1].defer_until).toBeNull();
+        expect((await h.getEvents()).map((e) => e.id).sort()).toEqual(
+          [plain.id, rushed.id].sort(),
+        );
       });
 
       it("leaves events of types the processor doesn't handle unfanned", async () => {

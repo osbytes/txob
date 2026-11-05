@@ -46,6 +46,16 @@ const handlerMap = createEventHandlerMap({
         },
       },
 
+      // Runs an hour after the event was published, unless publish() asked for a different delay
+      followUp: {
+        defer: { delayMs: 3_600_000 },
+        handler: async (event) => {
+          console.log(
+            `${event.id} followUp ${event.defer_until?.toISOString()}`,
+          );
+        },
+      },
+
       // Per-account updates must not race: one at a time per account, accounts in parallel
       updateAccountStats: {
         concurrency: {

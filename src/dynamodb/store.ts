@@ -110,6 +110,8 @@ const toEvent = (item: Item): TxOBEvent => ({
   data: JSON.parse(item.data),
   correlation_id: item.correlation_id ?? null,
   created_at: new Date(item.created_at),
+  defer_until:
+    item.defer_until === undefined ? null : new Date(item.defer_until),
 });
 
 const jitter = () =>
@@ -559,6 +561,9 @@ export const createDynamoStore = (
             data: JSON.stringify(event.data),
             correlation_id: event.correlation_id,
             created_at: event.created_at.getTime(),
+            ...(event.defer_until
+              ? { defer_until: event.defer_until.getTime() }
+              : {}),
             fanout_type: event.type,
             fanout_run_after: event.created_at.getTime(),
             fanout_attempts: 0,
@@ -663,8 +668,9 @@ export const createDynamoStore = (
         ),
       );
       await Promise.all(
-        deliveries.map(async (d) => {
+        deliveries.map(async ({ run_after, ...d }) => {
           const id = deliveryId(d);
+          const runAfter = run_after?.getTime() ?? now;
           try {
             await doc.send(
               new PutCommand({
@@ -674,10 +680,10 @@ export const createDynamoStore = (
                   ...d,
                   status: "pending",
                   attempts: 0,
-                  run_after: now,
+                  run_after: runAfter,
                   created_at: now,
                   queue_pk: queuePk(d.event_type, d.handler, d.priority),
-                  queue_sk: queueSk(now, id),
+                  queue_sk: queueSk(runAfter, id),
                 },
                 ConditionExpression: "attribute_not_exists(pk)",
               }),

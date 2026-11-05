@@ -55,6 +55,7 @@ const toEvent = (id: string, hash: Hash): TxOBEvent => ({
   data: JSON.parse(hash.data),
   correlation_id: hash.correlation_id ?? null,
   created_at: new Date(Number(hash.created_at)),
+  defer_until: hash.defer_until ? new Date(Number(hash.defer_until)) : null,
 });
 
 const nullable = (value: string | null) => (value === null ? "" : `=${value}`);
@@ -153,6 +154,7 @@ export const createRedisStore = <TClient extends RedisClientLike>(
         JSON.stringify(event.data),
         String(event.created_at.getTime()),
         nullable(event.correlation_id),
+        nullable(event.defer_until?.getTime().toString() ?? null),
       ]);
     },
 
@@ -188,6 +190,7 @@ export const createRedisStore = <TClient extends RedisClientLike>(
           d.handler,
           d.priority,
           nullable(d.concurrency_key),
+          d.run_after?.getTime() ?? "",
         ]),
       ]);
     },

@@ -133,6 +133,8 @@ try {
 
 `publish` validates the data against the event's schema (throwing `TxOBValidationError` on failure) and inserts it using the connection you pass, so it commits or rolls back with your data.
 
+Options: `id` (default: a random UUID), `correlation_id`, and `defer` to hold every delivery of the event back, overriding the handlers' own `defer` (see [Deferred delivery](#deferred-delivery)).
+
 **4. Process them:**
 
 ```typescript
@@ -239,14 +241,38 @@ Each handler is either a function or a config object:
   timeoutMs: 30_000, // abort the handler's signal after this long
 
   priority: (event) => (event.data.plan === "enterprise" ? 10 : 0), // or a number; higher first
+
+  defer: { delayMs: 60_000 }, // or { until: Date }, or a function of the event; see below
 }
 ```
 
 - **Concurrency, per-key concurrency and rate limits are global.** `concurrency: 5` means at most 5 deliveries of the handler run at once across all processors. Running deliveries are counted by their live leases, so a processor that crashes keeps holding its share until its leases expire (at most `leaseMs`).
 - **Claims for a limited handler are serialized** (a transaction-scoped advisory lock on Postgres, a short-lived lock document on MongoDB). Claims take milliseconds, but if one handler sees very high claim rates, prefer a higher `concurrency` on the processor over many tiny claims.
-- **`priority` and the `perKey` key are computed at fan-out** and stored with the delivery, so they're evaluated once per event, not per attempt.
+- **`priority`, the `perKey` key and `defer` are computed at fan-out** and stored with the delivery, so they're evaluated once per event, not per attempt.
 - **`timeoutMs` cancels the handler's context.** When it elapses, the `signal` passed to the handler is aborted with a `TxOBTimeoutError` reason. Honoring it is up to the handler: pass the signal to `fetch`, database drivers and so on, or check `signal.aborted`. Whatever the handler then does decides the outcome. If it throws, the attempt fails and is retried; if it finishes successfully anyway, the delivery is completed. The lease stays renewed while the handler runs.
 - **Process-wide defaults** go in `handlerDefaults: { retry, timeoutMs }`.
+
+### Deferred delivery
+
+`defer` holds a delivery back until a point in time. It takes `{ delayMs }`, counted from the event's `created_at`, or `{ until: Date }`. The handler definition sets the default; `publish` can override it per event:
+
+```typescript
+// Handler default: send the reminder a day after the order, unless the event says otherwise
+OrderPlaced: {
+  sendReminder: {
+    defer: (event) => (event.data.reminderAt ? { until: event.data.reminderAt } : { delayMs: 86_400_000 }),
+    handler: async (event) => {},
+  },
+},
+
+// Publish-time override: every handler of this event waits 10 minutes
+await outbox.publish(tx, "OrderPlaced", data, { defer: { delayMs: 600_000 } });
+```
+
+- **Resolved once, to a timestamp.** `publish` resolves its `defer` immediately and stores it on the event as `defer_until`. The processor resolves a handler's `defer` at fan-out, so a change to it applies to events fanned out afterwards. Either way the result is the delivery's `run_after`. `delayMs` counts from `created_at`, not from fan-out, so a processor that was down for an hour doesn't push "in 5 minutes" to "in 65 minutes", and repeated fan-outs of the same event agree.
+- **The publish-time `defer` wins** over the handler's for every handler of that event. The resolved time is available to handler `defer` functions and handlers as `event.defer_until`, so a handler can opt out of honoring it.
+- **Due deliveries are picked up promptly.** The processor that fanned the event out polls when the earliest deferred delivery is due; beyond `pollingIntervalMs`, the regular poll finds it.
+- **Priority still applies.** A deferred delivery competes with everything else that is due once its time comes.
 
 ### Tuning at runtime
 
@@ -274,7 +300,7 @@ processor.getConfig(); // effective settings per handler, after overrides
 - **Typed:** event types, handler names and values are checked against your handler map.
 - **Declarative and idempotent:** `handlers` replaces any previous overrides, and handlers it doesn't mention revert to their definitions. Applying the same config twice changes nothing. Invalid config throws and leaves the current settings untouched.
 - **When it takes effect:** from the next claim. Attempts already running keep the settings they started with.
-- **What can't be changed live:** `priority` and the `perKey` key function. They are computed when an event fans out, so changes apply to events fanned out afterwards; the per-key _limit_ is tunable via `perKeyConcurrency`.
+- **What can't be changed live:** `priority`, `defer` and the `perKey` key function. They are computed when an event fans out, so changes apply to events fanned out afterwards; the per-key _limit_ is tunable via `perKeyConcurrency`.
 - **Scope:** `configure` changes this processor only. Global limits are checked with the claiming processor's settings, so apply the same config to every processor (shared config, a feature flag, or a broadcast to all instances) to keep them in agreement.
 
 ### Errors
@@ -427,6 +453,10 @@ SELECT event_id, handler, attempts, last_error FROM txob_deliveries WHERE status
 -- Retry a dead delivery
 UPDATE txob_deliveries SET status = 'pending', attempts = 0, run_after = now()
 WHERE event_id = $1 AND handler = $2;
+
+-- Deliveries waiting on a deferral
+SELECT event_id, handler, run_after FROM txob_deliveries
+WHERE status = 'pending' AND lease_token IS NULL AND run_after > now();
 ```
 
 ## MongoDB
@@ -622,7 +652,7 @@ A store implements `TxOBStore<TTx>`, where `TTx` is whatever handle your writes 
 
 1. **An atomic write with business data**, for `insertEvent`. Without this you don't have an outbox.
 2. **Compare-and-set**, for lease-fenced `completeDelivery`, `failDelivery`, `extendLeases` and `releaseDeliveries`.
-3. **An ordered query on due time**, for `claimEventsForFanout` and `claimDeliveries`.
+3. **An ordered query on due time**, for `claimEventsForFanout` and `claimDeliveries`. `completeFanout` must honor each new delivery's `run_after`, and `insertEvent` must persist `event.defer_until` and hand it back on later reads.
 
 The behavioral contract every store must satisfy lives in this repo at [`test/contract.ts`](./test/contract.ts) (it is not part of the npm package); copy it and run `runStoreContract(name, setup)` against your store. [`src/memory/store.ts`](./src/memory/store.ts) is a compact reference implementation.
 

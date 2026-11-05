@@ -11,6 +11,8 @@ export type TxOBNewDelivery = {
   handler: string;
   priority: number;
   concurrency_key: string | null;
+  /** Earliest claim time. `null` means claimable right away. */
+  run_after: Date | null;
 };
 
 /**
