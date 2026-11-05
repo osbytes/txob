@@ -27,13 +27,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v2
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
       - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v1
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: pnpm
 
       - name: Install dependencies
-        run: yarn install
+        run: pnpm install --frozen-lockfile
 
       - name: Start MongoDB replica set
         run: |
@@ -58,13 +62,13 @@ jobs:
           docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:latest
 
       - name: Generate Prisma Client for the adapter tests
-        run: yarn test:prepare
+        run: pnpm test:prepare
 
       - name: Typecheck
-        run: yarn typecheck
+        run: pnpm typecheck
 
       - name: Run the tests
-        run: yarn test:ci
+        run: pnpm test:ci
         env:
           TXOB_TEST_PG_URL: postgres://postgres:txob@localhost:5432/postgres
           TXOB_TEST_MONGO_URL: mongodb://localhost:27017/?directConnection=true

@@ -16,7 +16,7 @@ import { schema } from "./helpers.js";
  * Integration tests against a real Redis (or Valkey). Skipped unless TXOB_TEST_REDIS_URL is
  * set, e.g.
  *   docker run --rm -p 63799:6379 redis:8-alpine
- *   TXOB_TEST_REDIS_URL=redis://localhost:63799 yarn test
+ *   TXOB_TEST_REDIS_URL=redis://localhost:63799 pnpm test
  */
 const url = process.env.TXOB_TEST_REDIS_URL;
 
